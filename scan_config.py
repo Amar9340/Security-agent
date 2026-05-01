@@ -5,7 +5,8 @@ Passed through the entire pipeline: Orchestrator → each Agent module.
 
 Dynamic fields: the UI shows different inputs based on auth_type selection.
 """
-from pydantic import BaseModel
+import os
+from pydantic import BaseModel, field_validator
 from typing import Optional
 
 
@@ -49,8 +50,13 @@ class ScanConfig(BaseModel):
 
     # ── ZAP-specific ───────────────────────────────────────────────────────
     zap_api_key:    Optional[str] = "changeme"
-    zap_api_base:   Optional[str] = "http://localhost:8090"
+    zap_api_base:   Optional[str] = None
     zap_context_name: Optional[str] = None  # named ZAP context for auth
+
+    @field_validator("zap_api_base", mode="before")
+    @classmethod
+    def _resolve_zap_base(cls, v):
+        return v or os.getenv("ZAP_API_BASE", "http://localhost:8090")
 
     # ── Cloud-specific ─────────────────────────────────────────────────────
     aws_profile:    Optional[str] = None

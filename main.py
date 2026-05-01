@@ -16,6 +16,9 @@ Scan modes supported:
 import logging
 import uuid
 from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime
 from typing import Optional
 
@@ -93,7 +96,7 @@ class ScanRequest(BaseModel):
     nmap_extra_args:      Optional[str]  = None
     nmap_ports:           Optional[str]  = None
     zap_api_key:          Optional[str]  = "changeme"
-    zap_api_base:         Optional[str]  = "http://localhost:8090"
+    zap_api_base:         Optional[str]  = None
     aws_profile:          Optional[str]  = None
     aws_region:           Optional[str]  = "us-east-1"
     cloud_provider:       Optional[str]  = "aws"
