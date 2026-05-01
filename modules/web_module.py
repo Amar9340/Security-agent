@@ -68,7 +68,7 @@ def run_web_scan(target: str, config=None, checklist_items=None) -> dict:
         logger.info("[WEB] ZAP + Nuclei unavailable — running built-in HTTP probes")
         findings = _probe_target(url, auth_hdrs, config)
         tools    = [TOOL_PROBE]
-    elif len(tools) > 1:
+    else:
         before   = len(findings)
         findings = _dedup_findings(findings)
         logger.info(f"[WEB] Dedup: {before} → {len(findings)} findings")
@@ -90,6 +90,13 @@ def _try_zap_scan(url: str, base: str, key: str, config) -> list | None:
         r = httpx.get(f"{base}/JSON/core/view/version/", params={"apikey": key}, timeout=4)
         if r.status_code != 200:
             return None
+
+        # Clear previous scan state so stale alerts don't contaminate this run
+        try:
+            httpx.get(f"{base}/JSON/core/action/newSession/",
+                      params={"apikey": key, "overwrite": "true"}, timeout=10)
+        except Exception:
+            pass
 
         # Set up context + auth if credentials provided
         if config and config.auth_type != "none":
@@ -117,9 +124,15 @@ def _try_zap_scan(url: str, base: str, key: str, config) -> list | None:
         ascan_id = ascan_r.json().get("scan", "0")
         _zap_wait("ascan", base, key, scan_id=ascan_id, timeout=dcfg["ascan_timeout"])
 
+        # Fetch all alerts then filter by target host in Python.
+        # Avoids trailing-slash / redirect mismatches with the ZAP baseurl param.
         alerts_r = httpx.get(f"{base}/JSON/core/view/alerts/",
-                             params={"apikey": key, "baseurl": url}, timeout=10)
-        alerts = alerts_r.json().get("alerts", [])
+                             params={"apikey": key, "start": "0", "count": "5000"}, timeout=15)
+        parsed_host = urlparse(url).netloc
+        alerts = [
+            a for a in alerts_r.json().get("alerts", [])
+            if parsed_host in a.get("url", "")
+        ]
 
         # Fetch real HTTP request/response for High/Medium alerts in parallel.
         # Low/Info findings keep raw ZAP fields — fetching all messages for
@@ -394,7 +407,12 @@ def _dedup_findings(findings: list) -> list:
     out:    list = []
 
     for f in findings:
-        key = (f.get("url", ""), f.get("name", "").lower().strip())
+        raw_url  = f.get("url", "")
+        try:
+            host = urlparse(raw_url).netloc or raw_url
+        except Exception:
+            host = raw_url
+        key = (host, f.get("name", "").lower().strip(), f.get("param", ""))
         if key not in seen:
             seen[key] = len(out)
             out.append(f)

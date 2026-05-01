@@ -238,9 +238,19 @@ def _generate_id(finding: dict, module: str) -> str:
     else:
         url = raw
 
-    # Include param for web vulns so SQLi on ?user= and ?pass= stay separate
-    param = finding.get("param", "") if ftype == "web_vulnerability" else ""
-    key   = f"{module}_{name}_{url}_{param}"
+    # For web vulns: collapse to host+param level so the same alert type on
+    # 50 different pages becomes ONE finding, not 50.
+    # SQLi on ?user= and SQLi on ?pass= remain separate (different param).
+    param = ""
+    if ftype == "web_vulnerability":
+        param = finding.get("param", "")
+        try:
+            p = urlparse(raw)
+            url = f"{p.scheme}://{p.netloc}" if p.netloc else raw
+        except Exception:
+            pass
+
+    key = f"{module}_{name}_{url}_{param}"
     return "FIND-" + hashlib.md5(key.encode()).hexdigest()[:8].upper()
 
 
