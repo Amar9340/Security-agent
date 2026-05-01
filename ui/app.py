@@ -48,6 +48,7 @@ st.markdown("""
     
     .stButton > button {
         padding: 8px 18px;
+        white-space: nowrap;
         border: none;
         border-radius: 8px;
         font-weight: 700;
@@ -650,203 +651,210 @@ elif page == "Review":
                         if f.get("reviewer_notes"):
                             st.caption(f"Notes: {f['reviewer_notes']}")
 
-            # ── Review queue ─────────────────────────────────────────────────
+            # ── Tabs: Review Queue / All Findings ────────────────────────────
             queue = api_get(f"/session/{sid}/review/queue")
-            st.divider()
+            if "batch_decisions" not in st.session_state:
+                st.session_state["batch_decisions"] = {}
 
-            if queue and queue.get("needs_review", 0) > 0:
-                needs    = queue["needs_review"]
-                reviewed_count = queue.get("reviewed", 0)
-                pending  = queue.get("pending", needs)
-                auto_sup = queue.get("auto_suppressed", 0)
+            SEV_COLORS = {
+                "Critical": "#dc2626", "High": "#ea580c",
+                "Medium":   "#d97706", "Low":  "#16a34a", "Info": "#0891b2",
+            }
 
-                if queue.get("complete"):
-                    st.success(f"All {needs} review items signed off. Session ready for export.")
-                else:
-                    st.warning(
-                        f"**{pending} of {needs} findings pending analyst review**  ·  "
-                        f"{reviewed_count} reviewed  ·  {auto_sup} auto-suppressed by AI"
+            needs_review = queue.get("needs_review", 0) if queue else 0
+            tab_queue, tab_all = st.tabs([
+                f"Review Queue ({needs_review})",
+                f"All Findings ({len(findings)})",
+            ])
+
+            # ── Tab 1: Review Queue ──────────────────────────────────────────
+            with tab_queue:
+                if not queue:
+                    st.error("Could not load review queue.")
+
+                elif queue.get("needs_review", 0) == 0:
+                    st.success(
+                        f"No findings require review "
+                        f"({queue.get('auto_suppressed', 0)} auto-suppressed by AI)."
                     )
-                    st.progress(reviewed_count / needs if needs else 1.0,
-                                text=f"{reviewed_count}/{needs} reviewed")
 
-                if "batch_decisions" not in st.session_state:
-                    st.session_state["batch_decisions"] = {}
+                else:
+                    needs          = queue["needs_review"]
+                    reviewed_count = queue.get("reviewed", 0)
+                    pending        = queue.get("pending", needs)
+                    auto_sup       = queue.get("auto_suppressed", 0)
 
-                SEV_COLORS = {
-                    "Critical": "#dc2626", "High": "#ea580c",
-                    "Medium": "#d97706",   "Low": "#16a34a", "Info": "#0891b2",
-                }
-
-                st.markdown("#### Review Queue")
-                for item in queue.get("items", []):
-                    fid      = item["finding_id"]
-                    sev      = item["severity"]
-                    name     = item["name"]
-                    cvss     = item.get("cvss_score", "-")
-                    status_q = item.get("review_status", "pending")
-                    color    = SEV_COLORS.get(sev, "#6b7280")
-                    full_f   = findings_by_id.get(fid, {})
-
-                    decision = st.session_state["batch_decisions"].get(fid, {})
-                    queued_badge = (f"  —  Queued: **{decision['action'].upper()}**"
-                                   + (f" → {decision['new_severity']}" if decision.get("new_severity") else "")
-                                   ) if decision else ""
-
-                    if status_q != "pending":
-                        exp_label = f"[{sev}] {name}  ·  CVSS {cvss}  ·  ✅ {status_q.upper()}"
+                    if queue.get("complete"):
+                        st.success(f"All {needs} review items signed off. Session ready for export.")
                     else:
-                        exp_label = f"[{sev}] {name}  ·  CVSS {cvss}  ·  {item.get('reason','')}{queued_badge}"
+                        st.warning(
+                            f"**{pending} of {needs} findings pending analyst review**  ·  "
+                            f"{reviewed_count} reviewed  ·  {auto_sup} auto-suppressed by AI"
+                        )
+                        st.progress(reviewed_count / needs if needs else 1.0,
+                                    text=f"{reviewed_count}/{needs} reviewed")
 
-                    with st.expander(exp_label):
-                        if full_f:
-                            _render_finding_detail(full_f)
+                    for item in queue.get("items", []):
+                        fid      = item["finding_id"]
+                        sev      = item["severity"]
+                        name     = item["name"]
+                        cvss     = item.get("cvss_score", "-")
+                        status_q = item.get("review_status", "pending")
+                        full_f   = findings_by_id.get(fid, {})
+                        decision = st.session_state["batch_decisions"].get(fid, {})
+
+                        queued_badge = (
+                            f"  —  Queued: {decision['action'].upper()}"
+                            + (f" → {decision['new_severity']}" if decision.get("new_severity") else "")
+                        ) if decision else ""
+
+                        if status_q != "pending":
+                            exp_label = f"[{sev}] {name}  ·  CVSS {cvss}  ·  ✅ {status_q.upper()}"
                         else:
-                            st.caption(f"URL: {item.get('url', '-')}")
-                            st.caption(f"FP status: {item.get('fp_status', '-')}")
+                            exp_label = f"[{sev}] {name}  ·  CVSS {cvss}  ·  {item.get('reason','')}{queued_badge}"
 
-                        if status_q == "pending":
-                            st.divider()
-                            b1, b2, b3, b4, b5, _ = st.columns([1, 1.3, 1, 1, 1.2, 1.5])
-                            with b1:
-                                if st.button("Confirm", key=f"q_confirm_{fid}"):
-                                    st.session_state["batch_decisions"][fid] = {
-                                        "finding_id": fid, "action": "confirm"}
-                                    st.rerun()
-                            with b2:
-                                if st.button("False Positive", key=f"q_fp_{fid}"):
-                                    st.session_state["batch_decisions"][fid] = {
-                                        "finding_id": fid, "action": "false_positive"}
-                                    st.rerun()
-                            with b3:
-                                if st.button("Downgrade", key=f"q_down_{fid}"):
-                                    st.session_state[f"show_sev_{fid}"] = "downgrade"
-                                    st.rerun()
-                            with b4:
-                                if st.button("Escalate", key=f"q_esc_{fid}"):
-                                    st.session_state[f"show_sev_{fid}"] = "escalate"
-                                    st.rerun()
-                            with b5:
-                                if st.button("Needs Retest", key=f"q_retest_{fid}"):
-                                    st.session_state["batch_decisions"][fid] = {
-                                        "finding_id": fid, "action": "needs_retest"}
-                                    st.rerun()
+                        with st.expander(exp_label):
+                            if full_f:
+                                _render_finding_detail(full_f)
+                            else:
+                                st.caption(f"URL: {item.get('url', '-')}")
+                                st.caption(f"FP status: {item.get('fp_status', '-')}")
 
-                            sev_action = st.session_state.get(f"show_sev_{fid}")
-                            if sev_action:
-                                sc1, sc2 = st.columns([2, 1])
-                                with sc1:
-                                    new_sev = st.selectbox(
-                                        f"New severity ({sev_action})",
-                                        ["Critical", "High", "Medium", "Low", "Info"],
-                                        key=f"newsev_{fid}",
-                                    )
-                                with sc2:
-                                    st.write("")
-                                    st.write("")
-                                    if st.button(f"Apply", key=f"apply_sev_{fid}"):
+                            if status_q == "pending":
+                                st.divider()
+                                b1, b2, b3, b4, b5, _ = st.columns([1, 1.4, 1.1, 1, 1.2, 1.3])
+                                with b1:
+                                    if st.button("Confirm", key=f"q_confirm_{fid}"):
                                         st.session_state["batch_decisions"][fid] = {
-                                            "finding_id": fid, "action": sev_action,
-                                            "new_severity": new_sev,
-                                        }
-                                        del st.session_state[f"show_sev_{fid}"]
+                                            "finding_id": fid, "action": "confirm"}
+                                        st.rerun()
+                                with b2:
+                                    if st.button("False Positive", key=f"q_fp_{fid}"):
+                                        st.session_state["batch_decisions"][fid] = {
+                                            "finding_id": fid, "action": "false_positive"}
+                                        st.rerun()
+                                with b3:
+                                    if st.button("Downgrade", key=f"q_down_{fid}"):
+                                        st.session_state[f"show_sev_{fid}"] = "downgrade"
+                                        st.rerun()
+                                with b4:
+                                    if st.button("Escalate", key=f"q_esc_{fid}"):
+                                        st.session_state[f"show_sev_{fid}"] = "escalate"
+                                        st.rerun()
+                                with b5:
+                                    if st.button("Needs Retest", key=f"q_retest_{fid}"):
+                                        st.session_state["batch_decisions"][fid] = {
+                                            "finding_id": fid, "action": "needs_retest"}
                                         st.rerun()
 
-                # ── Submit decisions ─────────────────────────────────────────
-                if not queue.get("complete"):
-                    st.divider()
-                    queued_count = len(st.session_state.get("batch_decisions", {}))
-                    an1, an2 = st.columns([2, 3])
-                    with an1:
-                        analyst_name = st.text_input("Analyst name", value="Security Analyst",
-                                                     key="analyst_name_input")
-                    sub_col, clr_col, _ = st.columns([1.5, 1, 3])
-                    with sub_col:
-                        if st.button(
-                            f"Submit {queued_count} Decision(s)",
-                            type="primary",
-                            disabled=queued_count == 0,
-                            use_container_width=True,
-                        ):
-                            decisions = list(st.session_state["batch_decisions"].values())
-                            for d in decisions:
-                                d["analyst"] = analyst_name
-                            result = api_post(f"/session/{sid}/review", {
-                                "decisions": decisions,
-                                "analyst":   analyst_name,
-                            })
-                            if result.get("error"):
-                                st.error(result["error"])
-                            else:
-                                st.session_state["batch_decisions"] = {}
-                                prog = result.get("queue_progress", {})
-                                if prog.get("complete"):
-                                    st.success("All findings reviewed. Session marked complete.")
+                                sev_action = st.session_state.get(f"show_sev_{fid}")
+                                if sev_action:
+                                    sc1, sc2 = st.columns([2, 1])
+                                    with sc1:
+                                        new_sev = st.selectbox(
+                                            f"New severity ({sev_action})",
+                                            ["Critical", "High", "Medium", "Low", "Info"],
+                                            key=f"newsev_{fid}",
+                                        )
+                                    with sc2:
+                                        st.write("")
+                                        st.write("")
+                                        if st.button("Apply", key=f"apply_sev_{fid}"):
+                                            st.session_state["batch_decisions"][fid] = {
+                                                "finding_id": fid, "action": sev_action,
+                                                "new_severity": new_sev,
+                                            }
+                                            del st.session_state[f"show_sev_{fid}"]
+                                            st.rerun()
+
+                    # Submit bar
+                    if not queue.get("complete"):
+                        st.divider()
+                        queued_count = len(st.session_state.get("batch_decisions", {}))
+                        an_col, _ = st.columns([2, 3])
+                        with an_col:
+                            analyst_name = st.text_input(
+                                "Analyst name", value="Security Analyst", key="analyst_name_input")
+                        sub_col, clr_col, _ = st.columns([1.5, 1, 3])
+                        with sub_col:
+                            if st.button(
+                                f"Submit {queued_count} Decision(s)",
+                                type="primary",
+                                disabled=queued_count == 0,
+                                use_container_width=True,
+                            ):
+                                decisions = list(st.session_state["batch_decisions"].values())
+                                for d in decisions:
+                                    d["analyst"] = analyst_name
+                                result = api_post(f"/session/{sid}/review", {
+                                    "decisions": decisions,
+                                    "analyst":   analyst_name,
+                                })
+                                if result.get("error"):
+                                    st.error(result["error"])
                                 else:
-                                    st.success(
-                                        f"{len(decisions)} decision(s) submitted. "
-                                        f"{prog.get('pending', '?')} still pending."
-                                    )
+                                    st.session_state["batch_decisions"] = {}
+                                    prog = result.get("queue_progress", {})
+                                    if prog.get("complete"):
+                                        st.success("All findings reviewed. Session marked complete.")
+                                    else:
+                                        st.success(
+                                            f"{len(decisions)} decision(s) submitted. "
+                                            f"{prog.get('pending', '?')} still pending."
+                                        )
+                                    st.rerun()
+                        with clr_col:
+                            if st.button("Clear", use_container_width=True):
+                                st.session_state["batch_decisions"] = {}
                                 st.rerun()
-                    with clr_col:
-                        if st.button("Clear", use_container_width=True):
-                            st.session_state["batch_decisions"] = {}
-                            st.rerun()
 
-            elif queue:
-                st.success(
-                    f"No findings require review "
-                    f"({queue.get('auto_suppressed', 0)} auto-suppressed by AI)."
-                )
-
-            # ── All Findings ─────────────────────────────────────────────────
-            st.divider()
-            st.markdown("### All Findings")
-
-            if not findings:
-                st.info("No findings for this session.")
-            else:
-                fc1, fc2, fc3 = st.columns(3)
-                with fc1:
-                    filter_severity = st.multiselect(
-                        "Severity",
-                        ["Critical", "High", "Medium", "Low", "Info"],
-                        default=["Critical", "High", "Medium", "Low", "Info"],
-                    )
-                with fc2:
-                    sort_by = st.selectbox("Sort by", ["Severity", "CVSS Score", "Module"])
-                with fc3:
-                    filter_module = st.multiselect(
-                        "Module", ["recon", "web", "network", "cloud"], default=[],
-                    )
-
-                filtered = [f for f in findings if f.get("severity") in filter_severity]
-                if filter_module:
-                    filtered = [f for f in filtered if f.get("module") in filter_module]
-                if sort_by == "CVSS Score":
-                    filtered = sorted(filtered, key=lambda x: x.get("cvss_score") or 0, reverse=True)
-                elif sort_by == "Module":
-                    filtered = sorted(filtered, key=lambda x: x.get("module", ""))
+            # ── Tab 2: All Findings ──────────────────────────────────────────
+            with tab_all:
+                if not findings:
+                    st.info("No findings for this session.")
                 else:
-                    sev_order = {"Critical":0,"High":1,"Medium":2,"Low":3,"Info":4}
-                    filtered = sorted(filtered, key=lambda x: sev_order.get(x.get("severity","Info"), 5))
+                    fc1, fc2, fc3 = st.columns(3)
+                    with fc1:
+                        filter_severity = st.multiselect(
+                            "Severity",
+                            ["Critical", "High", "Medium", "Low", "Info"],
+                            default=["Critical", "High", "Medium", "Low", "Info"],
+                        )
+                    with fc2:
+                        sort_by = st.selectbox("Sort by", ["Severity", "CVSS Score", "Module"])
+                    with fc3:
+                        filter_module = st.multiselect(
+                            "Module", ["recon", "web", "network", "cloud"], default=[],
+                        )
 
-                st.caption(f"Showing {len(filtered)} of {len(findings)} findings")
+                    filtered = [f for f in findings if f.get("severity") in filter_severity]
+                    if filter_module:
+                        filtered = [f for f in filtered if f.get("module") in filter_module]
+                    if sort_by == "CVSS Score":
+                        filtered = sorted(filtered, key=lambda x: x.get("cvss_score") or 0, reverse=True)
+                    elif sort_by == "Module":
+                        filtered = sorted(filtered, key=lambda x: x.get("module", ""))
+                    else:
+                        sev_order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+                        filtered = sorted(
+                            filtered, key=lambda x: sev_order.get(x.get("severity", "Info"), 5))
 
-                for idx, f in enumerate(filtered):
-                    severity   = f.get("severity", "Info")
-                    name       = f.get("name", "Unknown")
-                    cvss       = f.get("cvss_score", "-")
-                    rev_status = f.get("review_status", "")
-                    status_tag = ""
-                    if rev_status == "confirm":      status_tag = "  ✅"
-                    elif rev_status == "false_positive": status_tag = "  ❌ FP"
-                    elif rev_status == "needs_retest":   status_tag = "  🔁"
-                    elif rev_status in ("downgrade", "escalate"):
-                        status_tag = f"  ↕ {rev_status.title()}"
+                    st.caption(f"Showing {len(filtered)} of {len(findings)} findings")
 
-                    with st.expander(f"[{severity}]  {name}  ·  CVSS {cvss}{status_tag}"):
-                        _render_finding_detail(f)
+                    for f in filtered:
+                        severity   = f.get("severity", "Info")
+                        name       = f.get("name", "Unknown")
+                        cvss       = f.get("cvss_score", "-")
+                        rev_status = f.get("review_status", "")
+                        status_tag = ""
+                        if rev_status == "confirm":           status_tag = "  ✅"
+                        elif rev_status == "false_positive":  status_tag = "  ❌ FP"
+                        elif rev_status == "needs_retest":    status_tag = "  🔁"
+                        elif rev_status in ("downgrade", "escalate"):
+                            status_tag = f"  ↕ {rev_status.title()}"
+
+                        with st.expander(f"[{severity}]  {name}  ·  CVSS {cvss}{status_tag}"):
+                            _render_finding_detail(f)
 
 # ────────────────────────────────────────────────────────────────────────────
 # PAGE: EXPORT
