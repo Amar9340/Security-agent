@@ -271,14 +271,57 @@ with st.sidebar:
 
 if page == "Scan":
     st.markdown("# New Assessment")
-    
-    c1, c2 = st.columns([2, 1])
+
+    c1, c2, c3 = st.columns([3, 2, 1])
     with c1:
         st.markdown("### Target")
         target = st.text_input("URL or IP", placeholder="https://example.com", label_visibility="collapsed")
     with c2:
-        st.markdown("### Scan Depth")
+        st.markdown("### Scan Mode")
+        scan_mode_label = st.selectbox(
+            "Scan Mode",
+            ["Full", "Checklist", "Single Vulnerability", "OWASP"],
+            label_visibility="collapsed",
+            help=(
+                "Full: all applicable tests\n"
+                "Checklist: specific tests you choose\n"
+                "Single: one vulnerability only\n"
+                "OWASP: OWASP WSTG coverage (no internal checklist needed)"
+            ),
+        )
+    with c3:
+        st.markdown("### Depth")
         scan_depth_label = st.selectbox("Scan Depth", ["Standard", "Quick", "Deep"], label_visibility="collapsed")
+
+    _MODE_MAP = {
+        "Full": "full",
+        "Checklist": "checklist",
+        "Single Vulnerability": "single",
+        "OWASP": "owasp",
+    }
+    scan_mode = _MODE_MAP[scan_mode_label]
+
+    # Conditional inputs for modes that need test names
+    requested_tests = []
+    if scan_mode == "single":
+        st.markdown("### Vulnerability")
+        test_input = st.text_input(
+            "Vulnerability name",
+            placeholder="e.g. SQL Injection, XSS, CSRF",
+            label_visibility="collapsed",
+        )
+        if test_input.strip():
+            requested_tests = [test_input.strip()]
+
+    elif scan_mode == "checklist":
+        st.markdown("### Tests (one per line)")
+        tests_input = st.text_area(
+            "Tests",
+            placeholder="SQL Injection\nCross-Site Scripting\nCSRF",
+            height=100,
+            label_visibility="collapsed",
+        )
+        requested_tests = [t.strip() for t in tests_input.splitlines() if t.strip()]
 
     description = st.text_area("Description", placeholder="Assessment notes...", height=60)
 
@@ -337,12 +380,18 @@ if page == "Scan":
             st.error("Enter target")
         elif not alive:
             st.error("API offline")
+        elif scan_mode == "single" and not requested_tests:
+            st.error("Enter a vulnerability name for Single Vulnerability mode")
+        elif scan_mode == "checklist" and not requested_tests:
+            st.error("Enter at least one test for Checklist mode")
         else:
             payload = {
-                "target":     target,
-                "run_cloud":  include_cloud,
-                "description": description,
-                "scan_depth": _DEPTH_MAP[scan_depth_label],
+                "target":          target,
+                "run_cloud":       include_cloud,
+                "description":     description,
+                "scan_depth":      _DEPTH_MAP[scan_depth_label],
+                "scan_mode":       scan_mode,
+                "requested_tests": requested_tests,
                 **cred,
             }
             result = api_post("/scan", payload)
