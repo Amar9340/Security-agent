@@ -1134,7 +1134,7 @@ def probe_crossdomain_policy(url: str, hdrs: dict, config=None) -> list:
         body_lower = body.lower()
 
         # Wildcard domain — any origin can read responses
-        if re.search(r'domain=["\*]', body) or 'domain="*"' in body_lower:
+        if re.search(r'domain\s*=\s*["\']?\*', body, re.I) or 'domain="*"' in body_lower:
             findings.append({
                 "name": "crossdomain.xml: Wildcard Domain Allowed",
                 "type": "web_vulnerability", "risk": "High", "url": cdx_url,
@@ -1615,13 +1615,15 @@ def probe_browser_cache(url: str, hdrs: dict, config=None) -> list:
         return []
 
     cc = resp.headers.get("cache-control", "").lower()
-    if "no-store" not in cc and "private" not in cc:
+    if "no-store" not in cc:
         return [{
             "name": "Sensitive Page Cacheable",
             "type": "web_vulnerability", "risk": "Low", "url": url,
             "description": (
                 "Sensitive page does not set Cache-Control: no-store. "
-                "Browsers or proxies may cache credentials or session state."
+                "Cache-Control: private restricts proxy caching but the browser still "
+                "stores the response locally — credentials or session data may be "
+                "recovered from browser cache on shared devices."
             ),
             "solution": "Set Cache-Control: no-store, no-cache, must-revalidate on all authenticated pages.",
             "evidence": {
@@ -1971,7 +1973,7 @@ def probe_directory_traversal(url: str, hdrs: dict, config=None) -> list:
         r = _fetch(target, hdrs)
         if r and r.status_code == 200 and _is_vuln(r.text):
             findings.append(_finding(target, seq, r.text))
-            return findings  # one confirmed hit is sufficient
+            break  # one path-based hit is sufficient; continue to param probing
 
     # ── 2. common query-parameter traversal ───────────────────────────────────
     PARAM_NAMES = ["file", "path", "page", "template", "doc", "filename",
@@ -1982,7 +1984,7 @@ def probe_directory_traversal(url: str, hdrs: dict, config=None) -> list:
             r = _fetch(target, hdrs)
             if r and r.status_code == 200 and _is_vuln(r.text):
                 findings.append(_finding(target, seq, r.text))
-                return findings
+                break  # one hit per param is enough; continue to next param
 
     return findings
 
@@ -2070,7 +2072,7 @@ def probe_idor(url: str, hdrs: dict, config=None) -> list:
                         "probed_length":    len(r.text),
                     },
                 })
-                return findings  # first confirmed hit is sufficient
+                break  # one hit per path segment; continue to next segment
 
     # ── query-param ID probing ────────────────────────────────────────────────
     qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -2116,7 +2118,7 @@ def probe_idor(url: str, hdrs: dict, config=None) -> list:
                         "probed_length":   len(r.text),
                     },
                 })
-                return findings
+                break  # one hit per query param; continue to next param
 
     return findings
 
@@ -2443,7 +2445,7 @@ def probe_reflected_xss(url: str, hdrs: dict, config=None) -> list:
             r = _check_params(hit_url, payload)
             if r:
                 findings.append(_finding(hit_url, param, payload, r.text))
-                return findings
+                break  # one payload hit per param; continue to next param
 
     # ── 2. inject into common params if no existing params in URL ─────────────
     COMMON_PARAMS = ["q", "s", "search", "query", "id", "name", "input",
@@ -2455,7 +2457,7 @@ def probe_reflected_xss(url: str, hdrs: dict, config=None) -> list:
             r = _check_params(hit_url, payload)
             if r:
                 findings.append(_finding(hit_url, param, payload, r.text))
-                return findings
+                break  # one payload hit per param; continue to next param
 
     return findings
 
@@ -2563,6 +2565,7 @@ def probe_sql_injection(url: str, hdrs: dict, config=None) -> list:
         original = vals[0] if vals else ""
 
         # ── error-based ───────────────────────────────────────────────────────
+        confirmed = False
         for payload in [f"{original}'", f"{original}\"", f"{original}';--"]:
             r = _fetch(_make_url(param, payload), hdrs)
             if r and SQL_ERRORS.search(r.text):
@@ -2570,7 +2573,10 @@ def probe_sql_injection(url: str, hdrs: dict, config=None) -> list:
                     "error-based", _make_url(param, payload), param, payload,
                     "A database error message was returned.",
                 ))
-                return findings
+                confirmed = True
+                break
+        if confirmed:
+            continue
 
         # ── boolean-based ─────────────────────────────────────────────────────
         r_orig  = _fetch(url, hdrs)
@@ -2589,7 +2595,7 @@ def probe_sql_injection(url: str, hdrs: dict, config=None) -> list:
                     "boolean-based", _make_url(param, payload), param, payload,
                     "True/false conditions produce detectably different responses.",
                 ))
-                return findings
+                continue  # confirmed on this param; skip time-based, move to next param
 
         # ── time-based ────────────────────────────────────────────────────────
         TIME_PAYLOADS = [
@@ -2607,7 +2613,7 @@ def probe_sql_injection(url: str, hdrs: dict, config=None) -> list:
                     "time-based", _make_url(param, payload), param, payload,
                     f"Response delayed by {elapsed:.1f}s — blind time-based injection.",
                 ))
-                return findings
+                break  # one time-based hit per param; continue to next param
 
     return findings
 
@@ -2630,6 +2636,7 @@ def probe_http_smuggling(url: str, hdrs: dict, config=None) -> list:
     findings = []
 
     def _raw_request(request_bytes, timeout=10):
+        sock = None
         try:
             sock = socket.create_connection((host, port), timeout=timeout)
             if use_ssl:
@@ -2647,10 +2654,15 @@ def probe_http_smuggling(url: str, hdrs: dict, config=None) -> list:
                 resp += chunk
                 if b"\r\n\r\n" in resp:
                     break
-            sock.close()
             return resp.decode("utf-8", errors="replace")
         except Exception:
             return ""
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def _status(raw: str) -> int:
         try:
@@ -2683,9 +2695,9 @@ def probe_http_smuggling(url: str, hdrs: dict, config=None) -> list:
     for label, payload in [("CL.TE", cl_te), ("TE.CL", te_cl)]:
         raw = _raw_request(payload)
         status = _status(raw)
-        # Smuggling-susceptible servers often return 400 on the poisoned request
-        # or process it unexpectedly (200 with mismatched content)
-        if status in (400, 500, 501, 505):
+        # A 400 means the server correctly rejected the malformed request — that is safe.
+        # Flag only 5xx responses, which indicate the server processed the ambiguous request unexpectedly.
+        if status in (500, 501, 505):
             findings.append({
                 "name": f"Potential HTTP Request Smuggling ({label})",
                 "type": "web_vulnerability", "risk": "High", "url": url,
@@ -2777,7 +2789,7 @@ def probe_ssti(url: str, hdrs: dict, config=None) -> list:
             r = _fetch(hit_url, hdrs)
             if r and expected in r.text:
                 findings.append(_finding(hit_url, param, payload, engine, r.text))
-                return findings
+                break  # one confirmed engine hit per param; continue to next param
 
     return findings
 
@@ -3177,7 +3189,9 @@ def probe_open_redirect(url: str, hdrs: dict, config=None) -> list:
         try:
             r        = httpx.get(test_url, timeout=5, follow_redirects=False, headers=hdrs)
             location = r.headers.get("location", "")
-            if r.status_code in (301, 302, 303, 307, 308) and "evil.com" in location:
+            loc_host = urlparse(location).netloc
+            if r.status_code in (301, 302, 303, 307, 308) and (
+                    loc_host == "evil.com" or loc_host.endswith(".evil.com")):
                 return {
                     "name": "Open Redirect",
                     "type": "web_vulnerability", "risk": "Medium", "url": test_url,
@@ -3288,7 +3302,7 @@ def probe_graphql_introspection(url: str, hdrs: dict, config=None) -> list:
             if r.status_code == 200:
                 try:
                     data = r.json()
-                    if isinstance(data.get("data"), dict) and "__schema" in str(data["data"]):
+                    if isinstance(data.get("data"), dict) and "__schema" in data.get("data", {}):
                         return {
                             "name": "GraphQL Introspection Enabled",
                             "type": "information_disclosure", "risk": "Medium", "url": ep,
