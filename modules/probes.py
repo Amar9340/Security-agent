@@ -87,10 +87,10 @@ SESSION_NAMES = re.compile(
 
 
 def _fetch(url: str, hdrs: dict, method: str = "GET",
-           follow_redirects: bool = True, **kwargs) -> httpx.Response | None:
+           follow_redirects: bool = True, timeout: int = 8, **kwargs) -> httpx.Response | None:
     try:
         fn = getattr(httpx, method.lower())
-        return fn(url, headers=hdrs, timeout=8,
+        return fn(url, headers=hdrs, timeout=timeout,
                   follow_redirects=follow_redirects, **kwargs)
     except httpx.RequestError:
         return None
@@ -527,13 +527,9 @@ def probe_execution_paths(url: str, hdrs: dict, config=None) -> list:
     level1_urls: set = set()
 
     def _fetch_links(link_url):
-        try:
-            r = httpx.get(link_url, headers=hdrs, timeout=6,
-                          follow_redirects=True)
-            if "html" in r.headers.get("content-type", ""):
-                return _extract_urls(r.text, link_url)
-        except httpx.RequestError:
-            pass
+        r = _fetch(link_url, hdrs, timeout=6)
+        if r is not None and "html" in r.headers.get("content-type", ""):
+            return _extract_urls(r.text, link_url)
         return set()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
@@ -652,14 +648,8 @@ def probe_application_architecture(url: str, hdrs: dict, config=None) -> list:
     rh = {k.lower(): v for k, v in resp.headers.items()}
 
     # Second request with junk Host to provoke WAF signature
-    waf_resp = None
-    try:
-        waf_resp = httpx.get(
-            url, headers={**hdrs, "Host": "waf-probe.invalid.local"},
-            timeout=6, follow_redirects=False,
-        )
-    except httpx.RequestError:
-        pass
+    waf_resp = _fetch(url, {**hdrs, "Host": "waf-probe.invalid.local"},
+                      follow_redirects=False, timeout=6)
 
     waf_hdrs = ({k.lower(): v for k, v in waf_resp.headers.items()}
                 if waf_resp else {})
@@ -855,9 +845,8 @@ def probe_file_extensions(url: str, hdrs: dict, config=None) -> list:
             targets.append(f"{base_root}/{fname}{ext}")
 
     def _check(target_url):
-        try:
-            r = httpx.get(target_url, timeout=5, follow_redirects=False, headers=hdrs)
-            if r.status_code == 200 and len(r.content) > 0:
+        r = _fetch(target_url, hdrs, follow_redirects=False)
+        if r is not None and r.status_code == 200 and len(r.content) > 0:
                 return {
                     "name": "Backup/Temp File Exposed",
                     "type": "information_disclosure", "risk": "High", "url": target_url,
@@ -873,8 +862,6 @@ def probe_file_extensions(url: str, hdrs: dict, config=None) -> list:
                         "response_snippet": r.text[:200],
                     },
                 }
-        except httpx.RequestError:
-            pass
         return None
 
     findings = []
@@ -958,62 +945,58 @@ def probe_sensitive_paths(url: str, hdrs: dict, config=None) -> list:
     def _check(pt):
         path, name, risk, desc = pt
         target = urljoin(url.rstrip("/") + "/", path.lstrip("/"))
-        try:
-            r = httpx.get(target, timeout=5, follow_redirects=False, headers=hdrs)
-            if r.status_code in (200, 206):
-                return {
-                    "name": name, "type": "information_disclosure",
-                    "risk": risk, "url": target,
-                    "description": desc,
-                    "solution": f"Restrict access to {path} via server config or firewall.",
-                    "evidence": {
-                        "type": "sensitive_path",
-                        "curl_poc": f'curl -sk -i "{target}"',
-                        "status_code": r.status_code,
-                        "response_snippet": r.text[:300],
-                    },
-                }
-            if r.status_code in (401, 403):
-                return {
-                    "name": f"{name} (Path Exists — Access Restricted)",
-                    "type": "information_disclosure", "risk": "Low", "url": target,
-                    "description": f"{desc} Path confirmed to exist (HTTP {r.status_code}).",
-                    "solution": f"Confirm {path} is properly protected and bypass is not possible.",
-                    "evidence": {
-                        "type": "sensitive_path_restricted",
-                        "curl_poc": f'curl -sk -i "{target}"',
-                        "status_code": r.status_code,
-                    },
-                }
-        except httpx.RequestError:
-            pass
+        r = _fetch(target, hdrs, follow_redirects=False)
+        if r is None:
+            return None
+        if r.status_code in (200, 206):
+            return {
+                "name": name, "type": "information_disclosure",
+                "risk": risk, "url": target,
+                "description": desc,
+                "solution": f"Restrict access to {path} via server config or firewall.",
+                "evidence": {
+                    "type": "sensitive_path",
+                    "curl_poc": f'curl -sk -i "{target}"',
+                    "status_code": r.status_code,
+                    "response_snippet": r.text[:300],
+                },
+            }
+        if r.status_code in (401, 403):
+            return {
+                "name": f"{name} (Path Exists — Access Restricted)",
+                "type": "information_disclosure", "risk": "Low", "url": target,
+                "description": f"{desc} Path confirmed to exist (HTTP {r.status_code}).",
+                "solution": f"Confirm {path} is properly protected and bypass is not possible.",
+                "evidence": {
+                    "type": "sensitive_path_restricted",
+                    "curl_poc": f'curl -sk -i "{target}"',
+                    "status_code": r.status_code,
+                },
+            }
         return None
 
     # Directory listing — run alongside path checks
     def _dir_check(dir_path):
         parsed = urlparse(url)
         dir_url = f"{parsed.scheme}://{parsed.netloc}{dir_path}"
-        try:
-            r = httpx.get(dir_url, timeout=5, follow_redirects=False, headers=hdrs)
-            if r.status_code == 200:
-                body_l = r.text.lower()
-                if "index of" in body_l or "directory listing" in body_l:
-                    return {
-                        "name": "Directory Listing Enabled",
-                        "type": "information_disclosure", "risk": "Medium", "url": dir_url,
-                        "description": (
-                            f"Directory listing enabled at {dir_path} — "
-                            "file structure and sensitive documents enumerable."
-                        ),
-                        "solution": "Disable directory listing (Options -Indexes / autoindex off).",
-                        "evidence": {
-                            "type": "directory_listing",
-                            "curl_poc": f'curl -sk -i "{dir_url}"',
-                            "response_snippet": r.text[:300],
-                        },
-                    }
-        except httpx.RequestError:
-            pass
+        r = _fetch(dir_url, hdrs, follow_redirects=False)
+        if r is not None and r.status_code == 200:
+            body_l = r.text.lower()
+            if "index of" in body_l or "directory listing" in body_l:
+                return {
+                    "name": "Directory Listing Enabled",
+                    "type": "information_disclosure", "risk": "Medium", "url": dir_url,
+                    "description": (
+                        f"Directory listing enabled at {dir_path} — "
+                        "file structure and sensitive documents enumerable."
+                    ),
+                    "solution": "Disable directory listing (Options -Indexes / autoindex off).",
+                    "evidence": {
+                        "type": "directory_listing",
+                        "curl_poc": f'curl -sk -i "{dir_url}"',
+                        "response_snippet": r.text[:300],
+                    },
+                }
         return None
 
     dir_paths = ["/uploads/", "/images/", "/files/", "/static/",
@@ -1537,8 +1520,8 @@ def probe_https_redirect(url: str, hdrs: dict, config=None) -> list:
     """
     if not url.startswith("http://"):
         return []
-    try:
-        r = httpx.get(url, timeout=8, follow_redirects=False, headers=hdrs)
+    r = _fetch(url, hdrs, follow_redirects=False)
+    if r is not None:
         location = r.headers.get("location", "").lower()
         if r.status_code not in (301, 302, 303, 307, 308) or "https" not in location:
             return [{
@@ -1554,8 +1537,6 @@ def probe_https_redirect(url: str, hdrs: dict, config=None) -> list:
                     "response_snippet": f"HTTP {r.status_code} — no HTTPS redirect",
                 },
             }]
-    except httpx.RequestError:
-        pass
     return []
 
 
@@ -1568,32 +1549,30 @@ def probe_auth_bypass(url: str, hdrs: dict, config=None) -> list:
     has_auth = any(k.lower() in ("authorization", "cookie", "x-api-key") for k in hdrs)
     if not has_auth:
         return []
-    try:
-        authed   = httpx.get(url, timeout=8, follow_redirects=True, headers=hdrs)
-        unauthed = httpx.get(url, timeout=8, follow_redirects=True,
-                             headers={"User-Agent": "Mozilla/5.0 SecurityProbe/1.0"})
-        if (unauthed.status_code == authed.status_code and
-                abs(len(authed.text) - len(unauthed.text)) < 200 and
-                unauthed.status_code not in (401, 403, 302)):
-            return [{
-                "name": "Potential Authentication Bypass",
-                "type": "auth_misconfiguration", "risk": "High", "url": url,
-                "description": (
-                    "Unauthenticated request returned the same response as the authenticated one. "
-                    "Authentication enforcement may be missing."
-                ),
-                "solution": "Verify all endpoints enforce authentication. Implement global authz middleware.",
-                "evidence": {
-                    "type": "auth_bypass",
-                    "curl_poc": f'curl -sk -i "{url}"  # without auth headers',
-                    "authed_status": authed.status_code,
-                    "unauthed_status": unauthed.status_code,
-                    "authed_length": len(authed.text),
-                    "unauthed_length": len(unauthed.text),
-                },
-            }]
-    except httpx.RequestError:
-        pass
+    authed   = _fetch(url, hdrs)
+    unauthed = _fetch(url, {"User-Agent": "Mozilla/5.0 SecurityProbe/1.0"})
+    if authed is None or unauthed is None:
+        return []
+    if (unauthed.status_code == authed.status_code and
+            abs(len(authed.text) - len(unauthed.text)) < 200 and
+            unauthed.status_code not in (401, 403, 302)):
+        return [{
+            "name": "Potential Authentication Bypass",
+            "type": "auth_misconfiguration", "risk": "High", "url": url,
+            "description": (
+                "Unauthenticated request returned the same response as the authenticated one. "
+                "Authentication enforcement may be missing."
+            ),
+            "solution": "Verify all endpoints enforce authentication. Implement global authz middleware.",
+            "evidence": {
+                "type": "auth_bypass",
+                "curl_poc": f'curl -sk -i "{url}"  # without auth headers',
+                "authed_status": authed.status_code,
+                "unauthed_status": unauthed.status_code,
+                "authed_length": len(authed.text),
+                "unauthed_length": len(unauthed.text),
+            },
+        }]
     return []
 
 
@@ -1684,22 +1663,16 @@ def probe_default_credentials(url: str, hdrs: dict, config=None) -> list:
     for path in LOGIN_PATHS:
         endpoint = base + path
         # Probe with first cred to check if endpoint exists
-        try:
-            probe = httpx.post(endpoint,
-                               json={"username": "admin", "password": "____probe____"},
-                               headers=combined, timeout=8, follow_redirects=True)
-        except Exception:
-            continue
-        if probe.status_code in (404, 405):
+        probe = _fetch(endpoint, combined, method="POST",
+                       json={"username": "admin", "password": "____probe____"})
+        if probe is None or probe.status_code in (404, 405):
             continue
 
         for username, password in DEFAULT_CREDS:
-            try:
-                r = httpx.post(endpoint,
-                               json={"username": username, "password": password,
-                                     "email": f"{username}@example.com"},
-                               headers=combined, timeout=8, follow_redirects=True)
-            except Exception:
+            r = _fetch(endpoint, combined, method="POST",
+                       json={"username": username, "password": password,
+                             "email": f"{username}@example.com"})
+            if r is None:
                 continue
 
             if _looks_successful(r):
@@ -1840,14 +1813,9 @@ def probe_password_reset_weakness(url: str, hdrs: dict, config=None) -> list:
     for path in RESET_PATHS:
         endpoint = base + path
 
-        try:
-            r = httpx.post(endpoint,
-                           json={"email": FAKE_EMAIL},
-                           headers=combined, timeout=10, follow_redirects=True)
-        except Exception:
-            continue
-
-        if r.status_code in (404, 405):
+        r = _fetch(endpoint, combined, method="POST",
+                   json={"email": FAKE_EMAIL}, timeout=10)
+        if r is None or r.status_code in (404, 405):
             continue
 
         body = r.text
@@ -1882,14 +1850,11 @@ def probe_password_reset_weakness(url: str, hdrs: dict, config=None) -> list:
 
         # ── rate limiting check — send 5 rapid requests ───────────────────────
         statuses = [r.status_code]
-        try:
-            for _ in range(4):
-                rr = httpx.post(endpoint,
-                                json={"email": FAKE_EMAIL},
-                                headers=combined, timeout=10, follow_redirects=True)
+        for _ in range(4):
+            rr = _fetch(endpoint, combined, method="POST",
+                        json={"email": FAKE_EMAIL}, timeout=10)
+            if rr is not None:
                 statuses.append(rr.status_code)
-        except Exception:
-            pass
 
         all_ok = all(s not in (429, 423, 503) for s in statuses)
 
@@ -2800,9 +2765,9 @@ def probe_host_header_injection(url: str, hdrs: dict, config=None) -> list:
     WSTG-INPV-17: Test for Host Header Injection via X-Forwarded-Host.
     """
     evil_host = "probe-host-injection.invalid"
-    try:
-        inject = {**hdrs, "X-Forwarded-Host": evil_host, "X-Host": evil_host}
-        r      = httpx.get(url, timeout=5, follow_redirects=False, headers=inject)
+    inject = {**hdrs, "X-Forwarded-Host": evil_host, "X-Host": evil_host}
+    r      = _fetch(url, inject, follow_redirects=False)
+    if r is not None:
         body   = r.text
         rheads = "\n".join(f"{k}: {v}" for k, v in r.headers.items())
         if evil_host in body or evil_host in rheads:
@@ -2820,8 +2785,6 @@ def probe_host_header_injection(url: str, hdrs: dict, config=None) -> list:
                     "response_snippet": (body[:300] if evil_host in body else rheads[:300]),
                 },
             }]
-    except httpx.RequestError:
-        pass
     return []
 
 
@@ -3013,27 +2976,18 @@ def probe_file_upload(url: str, hdrs: dict, config=None) -> list:
     def _find_upload_endpoint():
         for path in UPLOAD_PATHS:
             endpoint = base + path
-            try:
-                r = httpx.get(endpoint, headers=hdrs, timeout=6,
-                               follow_redirects=True)
-                if r.status_code not in (404, 410):
-                    return endpoint
-                r = httpx.post(endpoint, headers=hdrs, timeout=6,
-                                follow_redirects=True)
-                if r.status_code not in (404, 410, 405):
-                    return endpoint
-            except Exception:
-                continue
+            r = _fetch(endpoint, hdrs, timeout=6)
+            if r is not None and r.status_code not in (404, 410):
+                return endpoint
+            r = _fetch(endpoint, hdrs, method="POST", timeout=6)
+            if r is not None and r.status_code not in (404, 410, 405):
+                return endpoint
         return None
 
     def _try_upload(endpoint, filename, content_type, file_bytes):
-        try:
-            files = {"file": (filename, file_bytes, content_type)}
-            r = httpx.post(endpoint, files=files, headers=hdrs,
-                           timeout=10, follow_redirects=True)
-            return r
-        except Exception:
-            return None
+        files = {"file": (filename, file_bytes, content_type)}
+        return _fetch(endpoint, hdrs, method="POST",
+                      files=files, timeout=10)
 
     def _upload_accepted(r) -> bool:
         if r is None:
@@ -3186,8 +3140,8 @@ def probe_open_redirect(url: str, hdrs: dict, config=None) -> list:
 
     def _test(param):
         test_url = f"{base}?{param}={evil_url}"
-        try:
-            r        = httpx.get(test_url, timeout=5, follow_redirects=False, headers=hdrs)
+        r        = _fetch(test_url, hdrs, follow_redirects=False)
+        if r is not None:
             location = r.headers.get("location", "")
             loc_host = urlparse(location).netloc
             if r.status_code in (301, 302, 303, 307, 308) and (
@@ -3207,8 +3161,6 @@ def probe_open_redirect(url: str, hdrs: dict, config=None) -> list:
                         "response_snippet": f"HTTP {r.status_code}\nLocation: {location}",
                     },
                 }
-        except httpx.RequestError:
-            pass
         return None
 
     findings = []
@@ -3228,9 +3180,8 @@ def probe_cors(url: str, hdrs: dict, config=None) -> list:
     """
     evil_origin = "https://cors-probe.evil.com"
     findings = []
-    try:
-        r    = httpx.get(url, timeout=5, follow_redirects=True,
-                         headers={**hdrs, "Origin": evil_origin})
+    r = _fetch(url, {**hdrs, "Origin": evil_origin})
+    if r is not None:
         acao = r.headers.get("access-control-allow-origin", "")
         acac = r.headers.get("access-control-allow-credentials", "")
 
@@ -3275,8 +3226,6 @@ def probe_cors(url: str, hdrs: dict, config=None) -> list:
                     "response_snippet": f"ACAO: {acao}\nACAC: {acac}",
                 },
             })
-    except httpx.RequestError:
-        pass
     return findings
 
 
@@ -3293,17 +3242,13 @@ def probe_graphql_introspection(url: str, hdrs: dict, config=None) -> list:
 
     def _probe(path):
         ep = base + path
-        try:
-            r = httpx.post(
-                ep, content=iq,
-                headers={**hdrs, "Content-Type": "application/json"},
-                timeout=5, follow_redirects=False,
-            )
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    if isinstance(data.get("data"), dict) and "__schema" in data.get("data", {}):
-                        return {
+        r  = _fetch(ep, {**hdrs, "Content-Type": "application/json"},
+                    method="POST", content=iq, follow_redirects=False)
+        if r is not None and r.status_code == 200:
+            try:
+                data = r.json()
+                if isinstance(data.get("data"), dict) and "__schema" in data.get("data", {}):
+                    return {
                             "name": "GraphQL Introspection Enabled",
                             "type": "information_disclosure", "risk": "Medium", "url": ep,
                             "description": (
@@ -3320,10 +3265,8 @@ def probe_graphql_introspection(url: str, hdrs: dict, config=None) -> list:
                                 "response_snippet": r.text[:300],
                             },
                         }
-                except Exception:
-                    pass
-        except httpx.RequestError:
-            pass
+            except Exception:
+                pass
         return None
 
     findings = []
