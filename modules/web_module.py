@@ -28,6 +28,63 @@ TOOL_PROBE    = "Built-in HTTP Probe"
 # Maps WSTG checklist IDs to Nuclei tag(s) for focused single/checklist scans.
 # When checklist_ids is provided, only templates matching these tags run —
 # reduces scan time from 10 min to under 60 s in single-vuln mode.
+# Maps WSTG IDs to keywords present in ZAP/Nuclei finding names for that test.
+# Used to drop unrelated passive-scan findings in single/checklist mode.
+WSTG_TO_FINDING_KEYWORDS: dict[str, list[str]] = {
+    "WSTG-INPV-01": ["xss", "cross site scripting", "cross-site scripting"],
+    "WSTG-INPV-02": ["xss", "cross site scripting", "stored"],
+    "WSTG-INPV-04": ["parameter pollution", "hpp"],
+    "WSTG-INPV-05": ["sql injection", "sql"],
+    "WSTG-INPV-06": ["ldap injection", "ldap"],
+    "WSTG-INPV-07": ["xml injection", "xxe", "xml external"],
+    "WSTG-INPV-08": ["ssi injection", "server side include"],
+    "WSTG-INPV-12": ["command injection", "os injection", "remote code"],
+    "WSTG-INPV-13": ["ssrf", "server-side request forgery"],
+    "WSTG-INPV-15": ["smuggling"],
+    "WSTG-INPV-17": ["host header"],
+    "WSTG-INPV-18": ["template injection", "ssti"],
+    "WSTG-CONF-03": ["backup", "temp file", ".bak", ".old", ".orig"],
+    "WSTG-CONF-04": ["git", ".env", "htpasswd", "sensitive", "exposed", "credentials"],
+    "WSTG-CONF-05": ["admin", "phpmyadmin", "console", "actuator", "phpinfo"],
+    "WSTG-CONF-06": ["http method", "put enabled", "delete enabled", "trace enabled"],
+    "WSTG-CONF-07": ["hsts", "strict-transport", "content security policy", "csp",
+                     "clickjacking", "x-frame", "mime sniff", "x-content-type",
+                     "referrer policy", "permissions policy"],
+    "WSTG-CONF-08": ["crossdomain", "cross-domain"],
+    "WSTG-CONF-10": ["subdomain takeover"],
+    "WSTG-IDNT-04": ["account enumeration", "user enumeration"],
+    "WSTG-ATHN-01": ["https redirect", "no https", "unencrypted"],
+    "WSTG-ATHN-02": ["default credentials", "default password", "default login"],
+    "WSTG-ATHN-04": ["auth bypass", "authentication bypass"],
+    "WSTG-ATHN-05": ["autocomplete", "remember password"],
+    "WSTG-ATHN-06": ["browser cache", "cache-control", "sensitive page cacheable"],
+    "WSTG-ATHN-09": ["password reset", "reset token"],
+    "WSTG-ATHZ-01": ["traversal", "path traversal", "directory traversal", "lfi"],
+    "WSTG-ATHZ-04": ["idor", "insecure direct object"],
+    "WSTG-SESS-01": ["session token", "weak entropy", "sequential session"],
+    "WSTG-SESS-02": ["cookie", "samesite", "httponly", "secure flag"],
+    "WSTG-SESS-03": ["session in url", "session fixation"],
+    "WSTG-SESS-04": ["session variable", "session in url"],
+    "WSTG-SESS-05": ["csrf", "anti-csrf", "cross-site request forgery"],
+    "WSTG-CLNT-03": ["html injection"],
+    "WSTG-CLNT-04": ["open redirect", "url redirect"],
+    "WSTG-CLNT-07": ["cors", "cross-origin"],
+    "WSTG-CLNT-09": ["clickjacking", "x-frame-options"],
+    "WSTG-CLNT-13": ["xssi", "jsonp", "json array"],
+    "WSTG-ERRH-01": ["error disclosure", "stack trace", "sql error", "php error"],
+    "WSTG-CRYP-01": ["tls", "ssl", "weak cipher", "weak protocol", "certificate"],
+    "WSTG-BUSL-08": ["file upload", "unrestricted upload"],
+    "WSTG-INFO-02": ["server version", "server header", "x-powered-by", "version disclosed"],
+    "WSTG-INFO-03": ["robots.txt", "sitemap", "metafile"],
+    "WSTG-INFO-04": ["graphql"],
+    "WSTG-INFO-05": ["html comment", "suspicious comment"],
+    "WSTG-INFO-06": ["entry point", "hidden field", "file upload entry"],
+    "WSTG-INFO-07": ["path map", "execution path", "api endpoint"],
+    "WSTG-INFO-08": ["framework identified", "x-powered-by"],
+    "WSTG-INFO-09": ["wordpress", "joomla", "drupal", "cms"],
+    "WSTG-INFO-10": ["architecture", "cdn", "waf detected"],
+}
+
 WSTG_TO_NUCLEI_TAGS: dict[str, str] = {
     "WSTG-INPV-01": "xss",
     "WSTG-INPV-02": "xss",
@@ -86,7 +143,7 @@ def run_web_scan(target: str, config=None, checklist_items=None) -> dict:
     # ZAP, Nuclei, and probes run concurrently.
     # Probes always run regardless of ZAP/Nuclei outcome.
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
-        zap_future    = ex.submit(_try_zap_scan, url, zap_base, zap_key, config)
+        zap_future    = ex.submit(_try_zap_scan, url, zap_base, zap_key, config, checklist_ids)
         nuclei_future = ex.submit(_try_nuclei_scan, url, config, nuclei_tags)
         probe_future  = ex.submit(run_probes, url, base_hdrs, config, checklist_ids)
         zap_result    = zap_future.result()
@@ -117,6 +174,12 @@ def run_web_scan(target: str, config=None, checklist_items=None) -> dict:
     if not tools:
         tools = [TOOL_PROBE]
 
+    # In focused mode (single/checklist), drop findings unrelated to the
+    # requested tests. This removes ZAP passive-scan noise (header findings,
+    # cookie warnings, etc.) that bleeds in regardless of active scan rules.
+    if checklist_ids:
+        findings = _filter_to_checklist(findings, checklist_ids)
+
     before   = len(findings)
     findings = _dedup_findings(findings)
     logger.info(f"[WEB] Final: {before} raw → {len(findings)} after dedup | tools: {tools}")
@@ -133,7 +196,8 @@ def run_web_scan(target: str, config=None, checklist_items=None) -> dict:
 
 # ── ZAP ───────────────────────────────────────────────────────────────────────
 
-def _try_zap_scan(url: str, base: str, key: str, config) -> list | None:
+def _try_zap_scan(url: str, base: str, key: str, config,
+                  checklist_ids: list | None = None) -> list | None:
     try:
         r = httpx.get(f"{base}/JSON/core/view/version/", params={"apikey": key}, timeout=4)
         if r.status_code != 200:
@@ -145,6 +209,18 @@ def _try_zap_scan(url: str, base: str, key: str, config) -> list | None:
                       params={"apikey": key, "overwrite": "true"}, timeout=10)
         except Exception:
             pass
+
+        # In focused mode, disable the passive scanner entirely — passive rules
+        # generate header/cookie/CSP findings regardless of which active scan
+        # rules run, creating noise when only one vulnerability type was requested.
+        # The scanner is re-enabled after the scan so the next session is unaffected.
+        if checklist_ids:
+            try:
+                httpx.get(f"{base}/JSON/pscan/action/disableAllScanners/",
+                          params={"apikey": key}, timeout=5)
+                logger.info("[ZAP] Passive scanner disabled for focused scan")
+            except Exception:
+                pass
 
         # Set up context + auth if credentials provided
         if config and config.auth_type != "none":
@@ -216,6 +292,15 @@ def _try_zap_scan(url: str, base: str, key: str, config) -> list | None:
                         httpx.get(f"{base}/JSON/replacer/action/removeRule/",
                                   params={"apikey": key,
                                           "description": "auth_inject"}, timeout=5)
+            except Exception:
+                pass
+
+        # Re-enable passive scanner so the next scan session gets full results.
+        if checklist_ids:
+            try:
+                httpx.get(f"{base}/JSON/pscan/action/enableAllScanners/",
+                          params={"apikey": key}, timeout=5)
+                logger.info("[ZAP] Passive scanner re-enabled")
             except Exception:
                 pass
 
@@ -449,6 +534,40 @@ def _zap_to_finding(alert: dict, message: dict | None = None) -> dict:
         "cwe":         alert.get("cweid",       ""),
         "evidence":    evidence,
     }
+
+
+# ── Checklist filter ─────────────────────────────────────────────────────────
+
+def _filter_to_checklist(findings: list, checklist_ids: list) -> list:
+    """
+    Drop findings whose names don't match the requested WSTG checklist IDs.
+    Used in single/checklist mode to suppress ZAP passive-scan noise
+    (missing headers, cookie attributes, etc.) that is always generated
+    regardless of which active-scan rules were requested.
+
+    Probe findings are already scoped at dispatch time via checklist_ids passed
+    to run_probes(), so this filter primarily affects ZAP and Nuclei results.
+    """
+    allowed_kw: set[str] = set()
+    for wid in checklist_ids:
+        for kw in WSTG_TO_FINDING_KEYWORDS.get(wid, []):
+            allowed_kw.add(kw.lower())
+
+    if not allowed_kw:
+        return findings  # no keyword map defined for these IDs — pass everything through
+
+    kept, dropped = [], 0
+    for f in findings:
+        name = f.get("name", "").lower()
+        if any(kw in name for kw in allowed_kw):
+            kept.append(f)
+        else:
+            dropped += 1
+
+    if dropped:
+        logger.info(f"[WEB] Checklist filter: {len(kept)} kept, {dropped} dropped "
+                    f"(passive-scan noise for {checklist_ids})")
+    return kept
 
 
 # ── Deduplication ────────────────────────────────────────────────────────────
