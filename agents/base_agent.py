@@ -10,6 +10,7 @@ Usage:
     agent = BaseAgent(llm=llm_client, tool_registry=registry, system_prompt=PROMPT)
     result = agent.run(goal="Test target.com for XSS", context={"target": "target.com"})
 """
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field
@@ -163,7 +164,8 @@ class BaseAgent:
             return {"error": f"Unknown tool '{name}'. Available: {list(self.tool_registry)}"}
 
         try:
-            if self.scope is not None:
+            # Only pass scope to tools whose signature actually accepts it
+            if self.scope is not None and "scope" in inspect.signature(fn).parameters:
                 return fn(scope=self.scope, **args)
             return fn(**args)
         except TypeError as e:

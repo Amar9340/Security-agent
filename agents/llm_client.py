@@ -69,6 +69,7 @@ _AVAILABILITY_TTL          = 60    # seconds before re-checking availability
 _CIRCUIT_BREAKER_THRESHOLD = 3     # consecutive failures before circuit opens
 _CIRCUIT_BREAKER_COOLDOWN  = 300   # seconds before circuit closes and retries
 _MAX_RETRIES               = 3     # attempts per provider per call
+_MAX_RETRY_WAIT            = 30    # cap on retry-after sleep — skip provider if Groq quota is exhausted
 
 
 class LLMClient:
@@ -430,7 +431,11 @@ class LLMClient:
             r = httpx.post(f"{base}/chat/completions",
                            json=payload, headers=headers, timeout=timeout)
             if r.status_code == 429:
-                raise _RateLimitError(int(r.headers.get("retry-after", 5)))
+                try:
+                    _ra = int(r.headers.get("retry-after", 5))
+                except (ValueError, TypeError):
+                    _ra = 5
+                raise _RateLimitError(_ra)
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"].strip() or None
 
@@ -448,7 +453,11 @@ class LLMClient:
         def _attempt() -> str | None:
             r = httpx.post(url, json=payload, timeout=_TIMEOUTS["gemini"])
             if r.status_code == 429:
-                raise _RateLimitError(int(r.headers.get("retry-after", 10)))
+                try:
+                    _ra = int(r.headers.get("retry-after", 10))
+                except (ValueError, TypeError):
+                    _ra = 10
+                raise _RateLimitError(_ra)
             r.raise_for_status()
             return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip() or None
 
@@ -514,7 +523,11 @@ class LLMClient:
             r = httpx.post(f"{base}/chat/completions",
                            json=payload, headers=headers, timeout=timeout)
             if r.status_code == 429:
-                raise _RateLimitError(int(r.headers.get("retry-after", 5)))
+                try:
+                    _ra = int(r.headers.get("retry-after", 5))
+                except (ValueError, TypeError):
+                    _ra = 5
+                raise _RateLimitError(_ra)
             r.raise_for_status()
             return _parse_openai_tool_response(r.json())
 
@@ -546,7 +559,11 @@ class LLMClient:
         def _attempt() -> dict | None:
             r = httpx.post(url, json=payload, timeout=_TIMEOUTS["gemini"])
             if r.status_code == 429:
-                raise _RateLimitError(int(r.headers.get("retry-after", 10)))
+                try:
+                    _ra = int(r.headers.get("retry-after", 10))
+                except (ValueError, TypeError):
+                    _ra = 10
+                raise _RateLimitError(_ra)
             r.raise_for_status()
             return _parse_gemini_tool_response(r.json())
 
@@ -626,6 +643,13 @@ class LLMClient:
                 return result
 
             except _RateLimitError as e:
+                if e.retry_after > _MAX_RETRY_WAIT:
+                    # Quota exhausted (e.g. Groq daily limit) — skip to next provider
+                    logger.warning(
+                        f"[LLM] 429 retry-after={e.retry_after}s exceeds cap "
+                        f"({_MAX_RETRY_WAIT}s) — skipping provider"
+                    )
+                    break
                 logger.warning(f"[LLM] 429 — waiting {e.retry_after}s (attempt {attempt}/{max_attempts})")
                 if attempt < max_attempts:
                     time.sleep(e.retry_after)
