@@ -19,9 +19,9 @@ from agents.knowledge_agent import KnowledgeAgent, ExecutionPlan, MODE_FULL
 from agents.fp_agent import analyse_findings
 from agents.reviewer_agent import ReviewerAgent
 from agents.recon_agent import ReconAgent
+from agents.web_agent import WebAgent
 from agents.llm_client import get_llm
 from modules.network_module import run_network_scan
-from modules.web_module import run_web_scan
 from modules.cloud_module import run_cloud_scan
 from enrichment import enrich_findings
 from database import crud
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _knowledge_agent = KnowledgeAgent()
 _reviewer_agent  = ReviewerAgent()
 _recon_agent     = ReconAgent(llm=get_llm())
+_web_agent       = WebAgent(llm=get_llm())
 
 
 class Orchestrator:
@@ -211,7 +212,7 @@ class Orchestrator:
             )
         if "web_agent" in agent_groups:
             _items = agent_groups["web_agent"]
-            task_map["web_agent"] = lambda i=_items: run_web_scan(
+            task_map["web_agent"] = lambda i=_items: _web_agent.run(
                 target, self.config,
                 checklist_items=i
             )
