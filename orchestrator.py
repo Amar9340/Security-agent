@@ -18,7 +18,8 @@ from datetime import datetime
 from agents.knowledge_agent import KnowledgeAgent, ExecutionPlan, MODE_FULL
 from agents.fp_agent import analyse_findings
 from agents.reviewer_agent import ReviewerAgent
-from modules.recon import run_recon
+from agents.recon_agent import ReconAgent
+from agents.llm_client import get_llm
 from modules.network_module import run_network_scan
 from modules.web_module import run_web_scan
 from modules.cloud_module import run_cloud_scan
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 # Singletons — loaded once, shared across all scan sessions
 _knowledge_agent = KnowledgeAgent()
 _reviewer_agent  = ReviewerAgent()
+_recon_agent     = ReconAgent(llm=get_llm())
 
 
 class Orchestrator:
@@ -93,7 +95,7 @@ class Orchestrator:
         try:
             # ── Phase 1: Recon ─────────────────────────────────────────────────
             _set("recon")
-            recon = run_recon(target, self.config)
+            recon = _recon_agent.run(target, self.config)
             session["raw_results"]["recon"] = recon
             session["agents_executed"].append("recon_agent")
 

@@ -101,6 +101,19 @@ report_finding.__schema__ = {
                 "items": {"type": "string"},
                 "description": "Optional list of reference URLs (OWASP, CVE, etc.).",
             },
+            "type": {
+                "type": "string",
+                "enum": [
+                    "missing_security_header", "ssl_error", "information_disclosure",
+                    "web_vulnerability", "open_port", "vulnerable_version",
+                    "auth_misconfiguration", "cloud_misconfiguration", "insecure_cookie",
+                ],
+                "description": "Finding type — used for CVSS mapping and compliance tagging.",
+            },
+            "url": {
+                "type": "string",
+                "description": "Affected URL or endpoint.",
+            },
         },
         "required": ["name", "severity", "evidence", "remediation"],
     },
