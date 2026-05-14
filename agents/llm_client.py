@@ -8,7 +8,9 @@ Each provider has its own circuit breaker and availability cache so a failure
 on Groq automatically promotes Gemini without human intervention.
 
 Stability features:
-  - Per-provider circuit breaker: 3 failures → 5 min cooldown, then retry
+  - Per-provider rate limiter: sliding-window RPM cap prevents 429s proactively
+  - Per-provider circuit breaker: 3 hard failures → 5 min cooldown, then retry
+  - 429 distinction: rate-limited providers are skipped without circuit-breaking
   - Per-provider availability TTL: re-checks every 60 s, recovers automatically
   - Retry with exponential backoff: ConnectError, Timeout, 5xx all retried
   - 429 handling: respects Retry-After header before trying next provider
@@ -16,10 +18,12 @@ Stability features:
   - chat_json retries once with stricter prompt on bad parse
   - Per-provider timeouts: Ollama 120 s, OpenRouter 45 s, cloud APIs 30 s
 """
+import collections
 import json
 import logging
 import os
 import re
+import threading
 import time
 from typing import Callable
 
@@ -46,7 +50,7 @@ OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 _PROVIDER_MODELS: dict[str, str] = {
     "groq":       os.getenv("GROQ_MODEL",       "llama-3.3-70b-versatile"),
     "gemini":     os.getenv("GEMINI_MODEL",     "gemini-2.0-flash"),
-    "openrouter": os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+    "openrouter": os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-3b-instruct:free"),
     "ollama":     os.getenv("OLLAMA_MODEL",     "gemma4:e4b"),
 }
 # LLM_MODEL overrides all providers if set (legacy behaviour preserved)
@@ -69,7 +73,47 @@ _AVAILABILITY_TTL          = 60    # seconds before re-checking availability
 _CIRCUIT_BREAKER_THRESHOLD = 3     # consecutive failures before circuit opens
 _CIRCUIT_BREAKER_COOLDOWN  = 300   # seconds before circuit closes and retries
 _MAX_RETRIES               = 3     # attempts per provider per call
-_MAX_RETRY_WAIT            = 30    # cap on retry-after sleep — skip provider if Groq quota is exhausted
+_MAX_RETRY_WAIT            = 30    # cap on retry-after sleep — skip provider if quota exhausted
+
+# Per-provider RPM caps (requests per minute).
+# Set conservatively below the free-tier limit so we never hit 429 for RPM.
+# Override via env vars for paid tiers (e.g. GROQ_RPM=500).
+_RPM_LIMITS: dict[str, int] = {
+    "groq":       int(os.getenv("GROQ_RPM",       "25")),   # free: 30 RPM
+    "gemini":     int(os.getenv("GEMINI_RPM",     "12")),   # free: 15 RPM
+    "openrouter": int(os.getenv("OPENROUTER_RPM", "15")),   # varies by model
+    "ollama":     int(os.getenv("OLLAMA_RPM",     "500")),  # local — no real limit
+}
+
+
+class _RateLimiter:
+    """
+    Sliding-window rate limiter.  Thread-safe — safe for parallel agents.
+    Blocks the caller until a request slot is available within the window.
+    """
+
+    def __init__(self, max_calls: int, window_seconds: float = 60.0):
+        self.max_calls = max_calls
+        self.window    = window_seconds
+        self._calls    = collections.deque()
+        self._lock     = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                # Expire calls outside the window
+                while self._calls and now - self._calls[0] > self.window:
+                    self._calls.popleft()
+
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return   # slot available
+
+                # Wait until the oldest call rolls out of the window
+                wait = self.window - (now - self._calls[0]) + 0.05
+
+            time.sleep(wait)   # sleep outside the lock
 
 
 class LLMClient:
@@ -85,6 +129,11 @@ class LLMClient:
 
         # Per-provider state: availability cache + circuit breaker
         self._state: dict[str, dict] = {}
+
+        # Per-provider rate limiters — shared across all threads / agents
+        self._rate_limiters: dict[str, _RateLimiter] = {
+            p: _RateLimiter(rpm) for p, rpm in _RPM_LIMITS.items()
+        }
 
         logger.info(
             f"[LLM] Primary: {self.provider} ({self.model}) | "
@@ -114,7 +163,12 @@ class LLMClient:
                 logger.debug(f"[LLM] Skipping {provider} (unavailable/circuit open)")
                 continue
 
-            result = self._try_provider(provider, system, user, temperature, max_tokens)
+            try:
+                result = self._try_provider(provider, system, user, temperature, max_tokens)
+            except _ProviderRateLimited:
+                logger.info(f"[LLM] {provider} rate-limited — trying next provider")
+                continue   # don't circuit-break; provider is working fine
+
             if result:
                 self._reset_fails(provider)
                 if provider != self.provider:
@@ -185,9 +239,14 @@ class LLMClient:
                 logger.debug(f"[LLM] Skipping {provider} (unavailable/circuit open)")
                 continue
 
-            result = self._try_provider_tools(
-                provider, system, messages, tools, temperature, max_tokens
-            )
+            try:
+                result = self._try_provider_tools(
+                    provider, system, messages, tools, temperature, max_tokens
+                )
+            except _ProviderRateLimited:
+                logger.info(f"[LLM] {provider} rate-limited — trying next provider")
+                continue   # don't circuit-break; provider is working fine
+
             if result:
                 self._reset_fails(provider)
                 if provider != self.provider:
@@ -339,6 +398,7 @@ class LLMClient:
 
     def _try_provider(self, provider: str, system: str, user: str,
                       temperature: float, max_tokens: int) -> str | None:
+        self._rate_limiters[provider].acquire()   # throttle to stay under RPM cap
         model = _PROVIDER_MODELS.get(provider, "unknown")
         try:
             if provider == "groq":
@@ -363,6 +423,8 @@ class LLMClient:
                 return self._chat_ollama(
                     model, system, user, temperature, max_tokens)
 
+        except _ProviderRateLimited:
+            raise   # propagate — caller skips without circuit-breaking
         except Exception as e:
             logger.warning(f"[LLM] {provider} dispatch error: {e}")
         return None
@@ -376,6 +438,7 @@ class LLMClient:
         temperature: float,
         max_tokens:  int,
     ) -> dict | None:
+        self._rate_limiters[provider].acquire()   # throttle to stay under RPM cap
         model = _PROVIDER_MODELS.get(provider, "unknown")
         try:
             if provider == "groq":
@@ -400,6 +463,8 @@ class LLMClient:
                 return self._chat_ollama_tools(
                     model, system, messages, tools, temperature, max_tokens)
 
+        except _ProviderRateLimited:
+            raise   # propagate — caller skips without circuit-breaking
         except Exception as e:
             logger.warning(f"[LLM] {provider} tools dispatch error: {e}")
         return None
@@ -633,8 +698,15 @@ class LLMClient:
     # ── Retry logic ────────────────────────────────────────────────────────────
 
     def _with_retry(self, fn: Callable, max_attempts: int = _MAX_RETRIES) -> str | None:
-        backoff = 2.0
-        t0      = time.time()
+        """
+        Retry fn up to max_attempts times with backoff.
+        Raises _ProviderRateLimited if ALL failures were 429s — the caller
+        must NOT circuit-break in that case; the provider is fine, just busy.
+        Returns None for genuine hard failures (connect error, 5xx, etc.).
+        """
+        backoff          = 2.0
+        t0               = time.time()
+        only_rate_limited = True   # flip to False on any non-429 failure
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -644,7 +716,6 @@ class LLMClient:
 
             except _RateLimitError as e:
                 if e.retry_after > _MAX_RETRY_WAIT:
-                    # Quota exhausted (e.g. Groq daily limit) — skip to next provider
                     logger.warning(
                         f"[LLM] 429 retry-after={e.retry_after}s exceeds cap "
                         f"({_MAX_RETRY_WAIT}s) — skipping provider"
@@ -655,16 +726,19 @@ class LLMClient:
                     time.sleep(e.retry_after)
 
             except httpx.TimeoutException:
+                only_rate_limited = False
                 logger.warning(f"[LLM] Timeout attempt {attempt}/{max_attempts} ({round(time.time()-t0,1)}s)")
                 if attempt < max_attempts:
                     time.sleep(backoff); backoff *= 2
 
             except httpx.ConnectError as e:
+                only_rate_limited = False
                 logger.warning(f"[LLM] ConnectError attempt {attempt}/{max_attempts}: {e}")
                 if attempt < max_attempts:
                     time.sleep(backoff); backoff *= 2
 
             except httpx.HTTPStatusError as e:
+                only_rate_limited = False
                 if e.response.status_code in (500, 502, 503, 504):
                     logger.warning(f"[LLM] HTTP {e.response.status_code} attempt {attempt}/{max_attempts}")
                     if attempt < max_attempts:
@@ -674,9 +748,12 @@ class LLMClient:
                     break
 
             except Exception as e:
+                only_rate_limited = False
                 logger.error(f"[LLM] Unexpected error attempt {attempt}/{max_attempts}: {e}")
                 break
 
+        if only_rate_limited:
+            raise _ProviderRateLimited()
         return None
 
     # ── JSON parsing ───────────────────────────────────────────────────────────
@@ -830,11 +907,19 @@ def _build_tool_prompt(tools: list) -> str:
     )
 
 
-# ── Rate-limit sentinel ────────────────────────────────────────────────────────
+# ── Rate-limit exceptions ──────────────────────────────────────────────────────
 
 class _RateLimitError(Exception):
+    """Raised inside _attempt() to signal a 429 with a retry-after value."""
     def __init__(self, retry_after: int = 5):
         self.retry_after = retry_after
+
+
+class _ProviderRateLimited(Exception):
+    """Raised by _with_retry when ALL retries were 429s.
+    The provider is working fine — callers must NOT record this as a failure
+    or open the circuit breaker."""
+    pass
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
