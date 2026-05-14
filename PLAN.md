@@ -1,149 +1,237 @@
-# AI-Driven VAPT Platform — Project Plan
+# AI-Driven VAPT Platform — Redesign Plan & Progress
 
-## Overview
+## What We're Building
 
-An AI-powered Vulnerability Assessment & Penetration Testing platform that:
-- Runs full scans, checklist-based scans, single-vulnerability scans, and OWASP-mode scans
-- Uses AI agents to orchestrate testing and triage findings
-- Integrates ZAP, Nuclei, Nmap, and Prowler
-- Produces company-standard reports (JSON / HTML / CSV / PDF)
-- Learns from analyst feedback (Phase 4)
+Replace every hardcoded decision in the pipeline with LLM reasoning.  
+**Before:** Python decides what to test, how to test it, and what it means.  
+**After:** LLM decides. Python executes tool calls and enforces schema.
 
 ---
 
-## Architecture
+## Target Architecture
 
 ```
-Streamlit UI  ←→  FastAPI (main.py)
-                       ↓
-               Orchestrator (orchestrator.py)
-                       ↓
-         Knowledge Agent (test selection)
-                       ↓
-     ┌─────────────────┼─────────────────┐
-  Web Agent       Network Agent      Cloud Agent
-  (ZAP, Nuclei,   (Nmap)             (Prowler)
-   HTTP probes)
-     └─────────────────┼─────────────────┘
-                       ↓
-              Enrichment (CVSS v3.1)
-                       ↓
-              FP Agent (3-stage pipeline)
-                       ↓
-              Reviewer Agent (human triage)
-                       ↓
-              Report Generator
-                       ↓
-              Database (SQLAlchemy / SQLite → PostgreSQL)
+FastAPI / Streamlit UI
+         ↓
+Orchestrator  (thin — sequences agents, no security logic)
+         ↓
+Agent Loop  (ReAct: THINK → TOOL CALL → OBSERVE → repeat)
+         ↓
+┌─────────────────────────────────────────────────────┐
+│  Recon Agent  Web Agent  Network Agent  Cloud Agent  │
+│  (all LLM-driven, call tools, report_finding())      │
+└─────────────────────────────────────────────────────┘
+         ↓
+Enrichment  (CVSS formula — stays hardcoded, not LLM)
+         ↓
+         ├── Critical / High  →  Human Review Queue
+         │     Reviewer Agent (LLM) writes a brief per finding
+         │     Analyst: confirm / false_positive / downgrade / escalate / needs_retest
+         │
+         └── Medium / Low / Info  →  Report Agent (draft mode, starts immediately)
+                    ↓
+         After review complete → Report Agent (finalise mode)
+                    ↓
+         Final Report  (JSON / HTML / CSV / PDF)
 ```
 
 ---
 
-## Core Design Rules
+## Tool Set  (replaces probes.py + all module logic)
 
-1. **Checklist is primary** — canonical names only, no free-text vulnerabilities
-2. **Standards fallback** — OWASP WSTG / NIST when no checklist item applies
-3. **Agents are domain-isolated** — Web ≠ Network ≠ Cloud
-4. **No raw tool output** — every finding normalized through agents
-5. **All findings must include PoC + CVSS score**
-6. **High severity (CVSS ≥ 7.0) must be human-validated**
-
----
-
-## Scan Modes
-
-| Mode       | Description                                              |
-|------------|----------------------------------------------------------|
-| full       | All agents run all tests                                 |
-| checklist  | Runs only the specified checklist items                  |
-| single     | One vulnerability by name (e.g. "SQL Injection")         |
-| owasp      | OWASP Top 10 coverage pass                               |
-
-Scan depth: `quick` / `standard` / `deep`
+| Tool | File | Replaces |
+|------|------|---------|
+| `http_request` | `agents/tools/http_tool.py` | All 47 probes in `probes.py` |
+| `dns_lookup` | `agents/tools/dns_tool.py` | DNS logic in `recon.py` |
+| `ssl_check` | `agents/tools/ssl_tool.py` | `probe_weak_tls` in `probes.py` |
+| `search_cve` | `agents/tools/cve_tool.py` | 6-entry hardcoded dict in `network_module.py` |
+| `run_nmap` | `agents/tools/nmap_tool.py` | `network_module.py` scan logic |
+| `run_nuclei` | `agents/tools/nuclei_tool.py` | Nuclei call in `web_module.py` |
+| `run_zap` | `agents/tools/zap_tool.py` | ZAP call in `web_module.py` |
+| `run_prowler` | `agents/tools/prowler_tool.py` | `cloud_module.py` (+ mock data removed) |
+| `report_finding` | `agents/tools/finding_tool.py` | Output contract — all agents use this |
 
 ---
 
-## Tech Stack
+## Human-in-the-Loop Flow
 
-- **Backend:** FastAPI + Python
-- **UI:** Streamlit (Forest Green + Gold theme)
-- **Database:** SQLAlchemy ORM — SQLite default, PostgreSQL-ready
-- **AI/LLM:** Provider-agnostic client — fallback chain: groq → gemini → openrouter → ollama
-- **Tools:** ZAP, Nuclei v3, Nmap, Prowler
-- **Deployment:** Docker Compose (FastAPI + PostgreSQL + Ollama)
+1. Scan completes → findings split into two parallel tracks
+2. **Critical / High** → Review Queue  
+   Reviewer Agent (LLM) writes a brief: evidence summary, confidence, attack chain context, suggested decision with reasoning
+3. **Medium / Low / Info** → Report Agent starts draft immediately (no waiting)
+4. Analyst works through queue in UI:  
+   `confirm` / `false_positive` / `downgrade` / `escalate` / `needs_retest`
+5. After all Critical/High reviewed → Report Agent finalises (merges analyst decisions into full report)
 
----
-
-## Component Status
-
-### Complete
-
-| Component | File | Notes |
-|-----------|------|-------|
-| FastAPI REST API v4 | `main.py` | Sessions, scans, validate, reports |
-| Orchestrator v3 | `orchestrator.py` | Coordinates full pipeline |
-| Knowledge Agent | `agents/knowledge_agent.py` | Checklist primary, OWASP/NIST fallback |
-| FP Agent (3-stage) | `agents/fp_agent.py` | Correlation → HTTP re-verify → LLM analysis |
-| Reviewer Agent | `agents/reviewer_agent.py` | Triage queue, analyst decisions, escalation |
-| LLM Client | `agents/llm_client.py` | Circuit breaker, retry, TTL cache, fallback chain |
-| Recon Module | `modules/recon.py` | Endpoint discovery, headers, tech fingerprint |
-| Web Module | `modules/web_module.py` | ZAP + Nuclei + HTTP probes |
-| Network Module | `modules/network_module.py` | Nmap |
-| Cloud Module | `modules/cloud_module.py` | Prowler |
-| HTTP Probes | `modules/probes.py` | 39 WSTG-aligned probes, @register registry |
-| Enrichment | `enrichment.py` | CVSS v3.1 + confidence scoring |
-| Report Generator | `report_generator.py` | JSON / HTML / CSV / PDF |
-| Streamlit UI | `ui/app.py` | Scan / Dashboard / Review / Export pages |
-| Database layer | `database/` | SQLAlchemy ORM, migration-ready |
-| Docker Compose | `docker-compose.yml` | One-command deployment |
-
-### Remaining (Phase 3)
-
-- [ ] **Performance:** parallel LLM batch processing, Redis caching, DB indexing, connection pooling
-- [ ] **Dashboard UI:** live scan progress, risk heat maps, report download centre
-- [ ] **Test suite:** 60 %+ coverage; automated tests against DVWA / WebGoat / Juice Shop
-- [ ] **Health check endpoint:** `GET /health` — DB + LLM + tool availability
-- [ ] **Structured logging** with rotation
-- [ ] **probes.py bug fixes (Session B–D):** 31 logic bugs, FP reductions, and missing functionality items from audit report
+**Session states:**  
+`running → scanning → enrichment → awaiting_review`  
+→ `draft_ready` (parallel with review) → `review_complete` → `report_finalised`
 
 ---
 
-## WSTG Probe Coverage
-
-39 of 94 WSTG v4.1 IDs are covered by HTTP probes in `modules/probes.py`.
-The remaining 55 are not automatable via blind HTTP probes — they require browser
-execution, app-specific business logic knowledge, or OS/server-level access.
-
-See `agents/fp_agent.py` docstring and memory for the full exclusion rationale.
+## Implementation Phases
 
 ---
 
-## Known Issues / Blockers
+### ✅ Phase 1 — Foundation  *(COMPLETE)*
+The agent engine and all tool wrappers. Nothing wired to the orchestrator yet —  
+this is the infrastructure everything else builds on.
 
-| Priority | Issue |
-|----------|-------|
-| Critical | External tool (ZAP/Nmap) timeouts — needs circuit breaker + retry backoff |
-| High | 100+ findings cause >30s LLM latency — needs parallel batch processing |
-| High | PostgreSQL migration untested (Docker Compose exists, migration path not validated) |
-| Medium | Confidence score calibration needs analyst feedback data |
-| Medium | SQLi probe misses URLs with no query params — needs common-param fallback |
-| Medium | ZAP passive scan runs regardless of scan mode — header findings bleed into single-vuln scans |
+| Part | File | What it does |
+|------|------|-------------|
+| 1A | `agents/base_agent.py` | ReAct loop engine — THINK → TOOL CALL → OBSERVE |
+| 1B | `agents/tool_registry.py` | Collects tool functions into `{name: callable}` dict |
+| 1C | `agents/tools/http_tool.py` | HTTP request with Python-level scope enforcement |
+| 1C | `agents/tools/finding_tool.py` | Output contract schema for all agents |
+| 1D | `agents/tools/dns_tool.py` | DNS lookups (A/AAAA/MX/NS/TXT/CNAME/SOA/PTR) |
+| 1D | `agents/tools/ssl_tool.py` | TLS cert inspection + protocol version probing |
+| 1D | `agents/tools/cve_tool.py` | Live NVD API CVE lookup |
+| 1E | `agents/tools/nmap_tool.py` | Nmap subprocess wrapper (XML output → structured dict) |
+| 1E | `agents/tools/nuclei_tool.py` | Nuclei subprocess wrapper (JSONL → structured findings) |
+| 1E | `agents/tools/zap_tool.py` | OWASP ZAP API wrapper (spider / passive / active) |
+| 1E | `agents/tools/prowler_tool.py` | Prowler cloud audit wrapper (FAIL findings only) |
+| 1F | `agents/llm_client.py` | Added `chat_with_tools()` — native tool calling for all 4 providers |
+
+**Key design decisions made in Phase 1:**
+- Scope enforcement is Python-level in `http_tool.py` — LLM cannot override it
+- `report_finding()` is intercepted by `BaseAgent` before the function body runs — schema validated internally
+- Ollama: tries native tool calling first, falls back to prompt injection
+- `_build_tool_prompt()` injects full schemas into system prompt for prompt-based fallback
 
 ---
 
-## Key Design Decisions
+### ⬜ Phase 2 — Recon Agent  *(NEXT)*
+**New file:** `agents/recon_agent.py`  
+**Retires:** `modules/recon.py`
 
-- **Evidence Agent not built as standalone** — evidence captured inline at source in each module; centralising would add overhead with zero new capability
-- **LLM only for Critical/High findings** — Medium/Low/Info keep heuristic scores to stay within free-tier rate limits
-- **FP Agent Stage 2 skips probe findings** — probes are already direct HTTP checks; re-verification would be redundant
-- **Nuclei runs alongside ZAP** — findings are deduplicated before enrichment
+The LLM decides what recon steps to take based on the target. No more hardcoded socket calls and header checks in sequence.
+
+Tools available: `dns_lookup`, `ssl_check`, `http_request`, `report_finding`
+
+What the LLM will do:
+- Query DNS records (A, MX, NS, TXT for SPF/DKIM/DMARC)
+- Check TLS cert and protocol versions
+- Probe HTTP headers (security headers, server banners, CORS)
+- Report findings: missing headers, weak TLS, info disclosure, open redirects
 
 ---
 
-## Phase 4 (Future)
+### ⬜ Phase 3 — Web Agent
+**New file:** `agents/web_agent.py`  
+**Retires:** `modules/web_module.py` detection logic, `modules/probes.py`
 
-- Learning Agent — feedback loop from analyst decisions to improve detection and scoring
-- Attack chaining — multi-step exploit sequences
-- Continuous monitoring mode
-- Dashboard analytics
-- Multi-tenant support
+Tools available: `http_request`, `run_zap`, `run_nuclei`, `report_finding`
+
+The LLM replaces all 47 hardcoded probes. It crafts its own HTTP requests based on what it observes, interprets ZAP and Nuclei output, and decides what is a real finding vs noise.
+
+---
+
+### ⬜ Phase 4A — Network Agent
+**New file:** `agents/network_agent.py`  
+**Retires:** `modules/network_module.py` analysis logic
+
+Tools available: `run_nmap`, `search_cve`, `http_request`, `report_finding`
+
+The LLM reads Nmap output, looks up CVEs for detected service versions, and decides which are exploitable in context.
+
+---
+
+### ⬜ Phase 4B — Cloud Agent
+**New file:** `agents/cloud_agent.py`  
+**Retires:** `modules/cloud_module.py` (including 6 hardcoded mock findings)
+
+Tools available: `run_prowler`, `report_finding`
+
+The LLM evaluates Prowler FAIL findings, prioritises by real-world risk, and writes analyst-quality findings.
+
+---
+
+### ⬜ Phase 5 — Remove Knowledge Agent
+**Deletes:** `agents/knowledge_agent.py`  
+**Demotes:** `checklist/registry.json` from runtime dependency to prompt reference  
+**Simplifies:** `orchestrator.py` — no more `ExecutionPlan`, agents self-direct
+
+The LLM decides what to test based on recon data and scan mode. The WSTG checklist becomes context in the system prompt, not a lookup table.
+
+---
+
+### ⬜ Phase 6 — Reviewer Agent + Human-in-the-Loop Gate
+**Rewrites:** `agents/reviewer_agent.py` (currently 3 if-statements + state machine)  
+**Deletes:** `agents/fp_agent.py` (LLM handles FP detection now)  
+**Updates:** `main.py` (review endpoints), `ui/app.py` (Review Queue + Report Preview tabs), `database/` (review state fields)
+
+For each Critical/High finding the LLM writes a structured brief:
+- Evidence summary, confidence assessment, attack chain context
+- Related findings, suggested analyst decision with reasoning
+
+Analyst sees two tabs: Review Queue (work through Critical/High) + Report Preview (draft already visible).
+
+---
+
+### ⬜ Phase 7 — Report Agent
+**New file:** `agents/report_agent.py`  
+**Updates:** `report_generator.py` (accepts LLM narrative)
+
+**Draft mode** (immediate, Medium/Low/Info): narrative sections, attack surface summary, remediation roadmap  
+**Finalise mode** (after review complete): merges analyst decisions, updates risk score, generates JSON/HTML/CSV/PDF
+
+---
+
+## Complete File Change Summary
+
+| File | Action | Phase | State |
+|------|--------|-------|-------|
+| `agents/base_agent.py` | New — ReAct loop engine | 1 | ✅ Done |
+| `agents/tool_registry.py` | New — tool dict builder | 1 | ✅ Done |
+| `agents/tools/http_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/finding_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/dns_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/ssl_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/cve_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/nmap_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/nuclei_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/zap_tool.py` | New | 1 | ✅ Done |
+| `agents/tools/prowler_tool.py` | New | 1 | ✅ Done |
+| `agents/llm_client.py` | Updated — `chat_with_tools()` added | 1 | ✅ Done |
+| `agents/recon_agent.py` | New — LLM recon | 2 | ⬜ Next |
+| `modules/recon.py` | Deleted | 2 | ⬜ |
+| `agents/web_agent.py` | New — LLM web scanning | 3 | ⬜ |
+| `modules/web_module.py` | Gutted (wrappers stay, analysis deleted) | 3 | ⬜ |
+| `modules/probes.py` | Deleted | 3 | ⬜ |
+| `agents/network_agent.py` | New — LLM network scanning | 4A | ⬜ |
+| `modules/network_module.py` | Gutted (Nmap wrapper stays) | 4A | ⬜ |
+| `agents/cloud_agent.py` | New — LLM cloud audit | 4B | ⬜ |
+| `modules/cloud_module.py` | Gutted (Prowler wrapper stays, mock data deleted) | 4B | ⬜ |
+| `agents/knowledge_agent.py` | Deleted | 5 | ⬜ |
+| `checklist/registry.json` | Demoted to prompt reference | 5 | ⬜ |
+| `orchestrator.py` | Simplified — no security logic | 5 | ⬜ |
+| `agents/reviewer_agent.py` | Rewritten as LLM agent | 6 | ⬜ |
+| `agents/fp_agent.py` | Deleted | 6 | ⬜ |
+| `main.py` | Updated — review queue endpoints | 6 | ⬜ |
+| `ui/app.py` | Updated — Review Queue + Report Preview tabs | 6 | ⬜ |
+| `database/` | Minor — review state fields | 6 | ⬜ |
+| `agents/report_agent.py` | New — LLM report narrative | 7 | ⬜ |
+| `report_generator.py` | Minor — accepts LLM narrative | 7 | ⬜ |
+| `enrichment.py` | Unchanged — CVSS formula stays | — | — |
+
+---
+
+## What Stays Hardcoded (Intentionally)
+
+| What | Where | Why |
+|------|-------|-----|
+| CVSS v3.1 formula | `enrichment.py` | Standard formula, not a judgment call |
+| Scope enforcement | `agents/tools/http_tool.py` | Python guardrail — must not be LLM-controlled |
+| Finding schema validation | `report_finding()` in `BaseAgent` | Structural contract |
+| Rate limiting + circuit breakers | `agents/llm_client.py` | Infrastructure |
+
+---
+
+## Rollback
+
+Last stable commit before redesign started: `620083d` on `main`  
+All Session B–F probe bug fixes are in this commit.
+
+```
+git checkout -b revert-to-original 620083d
+```

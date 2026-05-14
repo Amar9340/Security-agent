@@ -160,6 +160,44 @@ class LLMClient:
         logger.warning("[LLM] chat_json: both attempts returned unparseable JSON")
         return None
 
+    def chat_with_tools(
+        self,
+        system:      str,
+        messages:    list,
+        tools:       list,
+        temperature: float = 0.2,
+        max_tokens:  int   = 2048,
+    ) -> dict:
+        """
+        Multi-turn chat with tool schemas. Used by BaseAgent's ReAct loop.
+
+        Returns one of:
+          {"type": "tool_call", "tool": "name", "args": {...}, "thinking": "..."}
+          {"type": "done",      "content": "..."}
+          {"type": "message",   "content": "..."}
+        """
+        if self.provider == "none":
+            return {"type": "done", "content": "LLM provider disabled"}
+
+        for provider in self._build_chain():
+            if not self._provider_available(provider):
+                logger.debug(f"[LLM] Skipping {provider} (unavailable/circuit open)")
+                continue
+
+            result = self._try_provider_tools(
+                provider, system, messages, tools, temperature, max_tokens
+            )
+            if result:
+                self._reset_fails(provider)
+                if provider != self.provider:
+                    logger.info(f"[LLM] Fallback tools succeeded via {provider}")
+                return result
+
+            self._record_failure(provider, "chat_with_tools returned None")
+
+        logger.error("[LLM] chat_with_tools: all providers exhausted")
+        return {"type": "done", "content": "All LLM providers failed"}
+
     # ── Chain helpers ──────────────────────────────────────────────────────────
 
     def _build_chain(self) -> list[str]:
@@ -328,6 +366,43 @@ class LLMClient:
             logger.warning(f"[LLM] {provider} dispatch error: {e}")
         return None
 
+    def _try_provider_tools(
+        self,
+        provider:    str,
+        system:      str,
+        messages:    list,
+        tools:       list,
+        temperature: float,
+        max_tokens:  int,
+    ) -> dict | None:
+        model = _PROVIDER_MODELS.get(provider, "unknown")
+        try:
+            if provider == "groq":
+                return self._chat_openai_compat_tools(
+                    GROQ_BASE, GROQ_API_KEY, model,
+                    system, messages, tools, temperature, max_tokens)
+
+            if provider == "openrouter":
+                return self._chat_openai_compat_tools(
+                    OPENROUTER_BASE, OPENROUTER_API_KEY, model,
+                    system, messages, tools, temperature, max_tokens,
+                    extra_headers={
+                        "HTTP-Referer": "https://vapt-platform",
+                        "X-Title":      "VAPT Platform",
+                    })
+
+            if provider == "gemini":
+                return self._chat_gemini_tools(
+                    model, system, messages, tools, temperature, max_tokens)
+
+            if provider == "ollama":
+                return self._chat_ollama_tools(
+                    model, system, messages, tools, temperature, max_tokens)
+
+        except Exception as e:
+            logger.warning(f"[LLM] {provider} tools dispatch error: {e}")
+        return None
+
     # ── Provider implementations ───────────────────────────────────────────────
 
     def _chat_openai_compat(self, base: str, api_key: str, model: str,
@@ -412,6 +487,132 @@ class LLMClient:
 
         return self._with_retry(_attempt)
 
+    # ── Tool-calling provider implementations ─────────────────────────────────
+
+    def _chat_openai_compat_tools(
+        self, base: str, api_key: str, model: str,
+        system: str, messages: list, tools: list,
+        temperature: float, max_tokens: int,
+        extra_headers: dict = None,
+    ) -> dict | None:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+
+        payload = {
+            "model":       model,
+            "messages":    [{"role": "system", "content": system}] + messages,
+            "tools":       [{"type": "function", "function": t} for t in tools],
+            "tool_choice": "auto",
+            "temperature": temperature,
+            "max_tokens":  max_tokens,
+        }
+        pname   = "groq" if "groq" in base else "openrouter"
+        timeout = _TIMEOUTS.get(pname, 30)
+
+        def _attempt() -> dict | None:
+            r = httpx.post(f"{base}/chat/completions",
+                           json=payload, headers=headers, timeout=timeout)
+            if r.status_code == 429:
+                raise _RateLimitError(int(r.headers.get("retry-after", 5)))
+            r.raise_for_status()
+            return _parse_openai_tool_response(r.json())
+
+        return self._with_retry(_attempt)
+
+    def _chat_gemini_tools(
+        self, model: str,
+        system: str, messages: list, tools: list,
+        temperature: float, max_tokens: int,
+    ) -> dict | None:
+        url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+
+        # Convert messages to Gemini role format (user/model)
+        contents = []
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": m["content"]}]})
+
+        payload = {
+            "system_instruction": {"parts": [{"text": system}]},
+            "contents":           contents,
+            "tools":              [{"function_declarations": tools}],
+            "generationConfig":   {
+                "temperature":    temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+
+        def _attempt() -> dict | None:
+            r = httpx.post(url, json=payload, timeout=_TIMEOUTS["gemini"])
+            if r.status_code == 429:
+                raise _RateLimitError(int(r.headers.get("retry-after", 10)))
+            r.raise_for_status()
+            return _parse_gemini_tool_response(r.json())
+
+        return self._with_retry(_attempt)
+
+    def _chat_ollama_tools(
+        self, model: str,
+        system: str, messages: list, tools: list,
+        temperature: float, max_tokens: int,
+    ) -> dict | None:
+        # Try native tool calling via Ollama's OpenAI-compat endpoint first
+        # (supported by llama3.1+, mistral-nemo, qwen2.5, etc.)
+        try:
+            payload = {
+                "model":    model,
+                "messages": [{"role": "system", "content": system}] + messages,
+                "tools":    [{"type": "function", "function": t} for t in tools],
+                "stream":   False,
+                "options":  {"temperature": temperature, "num_predict": max_tokens},
+            }
+
+            def _native_attempt() -> dict | None:
+                r = httpx.post(f"{OLLAMA_BASE}/v1/chat/completions",
+                               json=payload, timeout=_TIMEOUTS["ollama"])
+                r.raise_for_status()
+                return _parse_openai_tool_response(r.json())
+
+            result = self._with_retry(_native_attempt)
+            if result and result.get("type") in ("tool_call", "done"):
+                return result
+        except Exception as e:
+            logger.debug(f"[LLM] Ollama native tool calling unavailable ({e}), using prompt fallback")
+
+        # Prompt-based fallback: inject tool schemas into system prompt
+        return self._chat_prompt_tools(model, system, messages, tools, temperature, max_tokens)
+
+    def _chat_prompt_tools(
+        self, model: str,
+        system: str, messages: list, tools: list,
+        temperature: float, max_tokens: int,
+    ) -> dict | None:
+        enhanced_system = system + "\n\n" + _build_tool_prompt(tools)
+
+        payload = {
+            "model":   model,
+            "stream":  False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "messages": [{"role": "system", "content": enhanced_system}] + messages,
+        }
+
+        def _attempt() -> dict | None:
+            r = httpx.post(f"{OLLAMA_BASE}/api/chat",
+                           json=payload, timeout=_TIMEOUTS["ollama"])
+            r.raise_for_status()
+            msg  = r.json().get("message", {})
+            text = msg.get("content", "").strip()
+            # Gemma extended-thinking fallback
+            if not text and msg.get("thinking"):
+                text = msg["thinking"].strip()
+            if not text:
+                return None
+            parsed = _try_parse_tool_json(text)
+            return parsed or {"type": "message", "content": text}
+
+        return self._with_retry(_attempt)
+
     # ── Retry logic ────────────────────────────────────────────────────────────
 
     def _with_retry(self, fn: Callable, max_attempts: int = _MAX_RETRIES) -> str | None:
@@ -491,6 +692,118 @@ class LLMClient:
 
         logger.warning(f"[LLM] Could not parse JSON: {text[:200]!r}")
         return None
+
+
+# ── Tool-response parsers (module-level, no self) ─────────────────────────────
+
+def _parse_openai_tool_response(data: dict) -> dict:
+    """Parse an OpenAI-compat chat/completions response that may contain tool_calls."""
+    msg = data["choices"][0]["message"]
+
+    if msg.get("tool_calls"):
+        tc   = msg["tool_calls"][0]
+        fn   = tc["function"]
+        try:
+            args = json.loads(fn["arguments"])
+        except (json.JSONDecodeError, KeyError):
+            args = {}
+        return {
+            "type":     "tool_call",
+            "tool":     fn.get("name", ""),
+            "args":     args,
+            "thinking": msg.get("content") or "",
+        }
+
+    content = (msg.get("content") or "").strip()
+    parsed  = _try_parse_tool_json(content)
+    if parsed:
+        return parsed
+    return {"type": "message", "content": content}
+
+
+def _parse_gemini_tool_response(data: dict) -> dict:
+    """Parse a Gemini generateContent response that may contain a functionCall."""
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError):
+        return {"type": "done", "content": ""}
+
+    for part in parts:
+        if "functionCall" in part:
+            fc = part["functionCall"]
+            return {
+                "type":     "tool_call",
+                "tool":     fc.get("name", ""),
+                "args":     fc.get("args", {}),
+                "thinking": "",
+            }
+
+    text   = " ".join(p.get("text", "") for p in parts).strip()
+    parsed = _try_parse_tool_json(text)
+    if parsed:
+        return parsed
+    return {"type": "message", "content": text}
+
+
+def _try_parse_tool_json(text: str) -> dict | None:
+    """
+    Extract a tool-call/done/message JSON from text.
+    Used as a secondary check when the LLM embeds JSON in a text response.
+    """
+    if not text:
+        return None
+
+    # Fast path — clean JSON
+    try:
+        d = json.loads(text)
+        if isinstance(d, dict) and d.get("type") in ("tool_call", "done", "message"):
+            return d
+    except json.JSONDecodeError:
+        pass
+
+    # Inside a markdown fence
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        try:
+            d = json.loads(fence.group(1))
+            if isinstance(d, dict) and d.get("type") in ("tool_call", "done", "message"):
+                return d
+        except json.JSONDecodeError:
+            pass
+
+    # Embedded JSON block containing a "type" key
+    m = re.search(r'\{[^{}]*"type"\s*:\s*"(?:tool_call|done|message)"[^{}]*\}',
+                  text, re.DOTALL)
+    if m:
+        try:
+            d = json.loads(m.group())
+            if isinstance(d, dict) and d.get("type") in ("tool_call", "done", "message"):
+                return d
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _build_tool_prompt(tools: list) -> str:
+    """
+    Inject tool schemas into the system prompt for providers without native
+    tool calling support. The LLM is instructed to output JSON responses only.
+    """
+    schemas = json.dumps(tools, indent=2)
+    return (
+        "TOOL CALLING INSTRUCTIONS:\n"
+        "You have access to the following tools. When you want to call a tool, "
+        "respond with ONLY this JSON (no other text before or after it):\n"
+        '{"type": "tool_call", "tool": "<tool_name>", '
+        '"args": {<args as JSON object>}, "thinking": "<one sentence reason>"}\n\n'
+        "When you have completed all tasks and have nothing more to investigate, "
+        "respond with ONLY this JSON:\n"
+        '{"type": "done", "content": "<brief summary of what was found>"}\n\n'
+        "Do NOT wrap your response in markdown code fences.\n"
+        "Do NOT add any text before or after the JSON.\n\n"
+        f"Available tools:\n{schemas}"
+    )
 
 
 # ── Rate-limit sentinel ────────────────────────────────────────────────────────
