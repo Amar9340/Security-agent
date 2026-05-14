@@ -16,6 +16,7 @@ from datetime import datetime
 
 from agents.fp_agent import analyse_findings
 from agents.reviewer_agent import ReviewerAgent
+from agents.report_agent import ReportAgent
 from agents.recon_agent import ReconAgent
 from agents.web_agent import WebAgent
 from agents.network_agent import NetworkAgent
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Singletons — loaded once, shared across all scan sessions
 _reviewer_agent = ReviewerAgent(llm=get_llm())
+_report_agent   = ReportAgent(llm=get_llm())
 _recon_agent    = ReconAgent(llm=get_llm())
 _web_agent      = WebAgent(llm=get_llm())
 _network_agent  = NetworkAgent(llm=get_llm())
@@ -137,6 +139,9 @@ class Orchestrator:
             )
 
             session["summary"] = self._build_summary(session["enriched_findings"], session)
+
+            # ── Phase 7: Report Agent — generate draft narrative ───────────────
+            session["report_narrative"] = _report_agent.draft(session)
 
         except Exception as e:
             logger.error(f"[ORCHESTRATOR] Fatal error: {e}", exc_info=True)

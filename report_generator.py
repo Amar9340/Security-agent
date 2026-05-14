@@ -37,15 +37,16 @@ def _gen_json(session: dict, base: str) -> str:
     report = {
         "report_meta": {
             "generated_at":  datetime.utcnow().isoformat(),
-            "tool":          "AI Security Testing Agent v2.0",
+            "tool":          "AI Security Testing Agent v5.0",
             "session_id":    session.get("session_id"),
             "target":        session.get("target"),
             "auth_used":     session.get("auth_used","Unauthenticated"),
             "scan_duration": session.get("duration_seconds"),
         },
         "executive_summary":  session.get("summary",{}),
+        "report_narrative":   session.get("report_narrative", {}),
         "findings":           session.get("enriched_findings",[]),
-        "modules_executed":   session.get("modules_executed",[]),
+        "modules_executed":   session.get("agents_executed", session.get("modules_executed",[])),
         "recon_data":         session.get("raw_results",{}).get("recon",{}),
     }
     with open(path,"w") as f:
@@ -298,14 +299,15 @@ def _gen_html(session: dict, base: str) -> str:
         """HTML-escape a value. Only substitutes default when val is None."""
         return _html.escape(str(val) if val is not None else default)
 
-    path     = base + ".html"
-    summary  = session.get("summary",{})
-    findings = session.get("enriched_findings",[])
-    target   = session.get("target","Unknown")
-    gen_at   = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    bd       = summary.get("severity_breakdown",{})
-    modules  = ", ".join(session.get("agents_executed",[]))
-    auth     = session.get("auth_used","Unauthenticated")
+    path      = base + ".html"
+    summary   = session.get("summary",{})
+    findings  = session.get("enriched_findings",[])
+    target    = session.get("target","Unknown")
+    gen_at    = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    bd        = summary.get("severity_breakdown",{})
+    modules   = ", ".join(session.get("agents_executed",[]))
+    auth      = session.get("auth_used","Unauthenticated")
+    narrative = session.get("report_narrative", {})
 
     def _badge(text, color):
         return f'<span style="background:{color};color:#fff;padding:2px 9px;border-radius:10px;font-size:11px;white-space:nowrap">{text}</span>'
@@ -444,6 +446,51 @@ def _gen_html(session: dict, base: str) -> str:
         for tool, count in tool_breakdown.items()
     )
 
+    # LLM narrative blocks
+    def _nl2br(text): return _html.escape(str(text or "")).replace("\n", "<br>")
+    def _narrative_card(title, body_html):
+        return (f'<div class="card" style="margin-bottom:1.5rem">'
+                f'<h3 style="color:#f1f5f9;font-size:1rem;font-weight:600;margin-bottom:.8rem">{title}</h3>'
+                f'{body_html}</div>')
+
+    exec_summary_html = ""
+    roadmap_html      = ""
+    if narrative:
+        is_draft = narrative.get("draft", True)
+        draft_badge = ('<span style="background:#d97706;color:#fff;font-size:10px;padding:1px 7px;'
+                       'border-radius:8px;margin-left:8px">DRAFT</span>') if is_draft else ""
+
+        # Executive summary card
+        exec_parts = []
+        if narrative.get("executive_summary"):
+            exec_parts.append(f'<p style="color:#cbd5e1;font-size:13px;line-height:1.7;margin-bottom:.8rem">{_nl2br(narrative["executive_summary"])}</p>')
+        if narrative.get("attack_surface"):
+            exec_parts.append(f'<p style="color:#94a3b8;font-size:12px;line-height:1.6"><strong style="color:#e2e8f0">Attack Surface:</strong> {_nl2br(narrative["attack_surface"])}</p>')
+        if narrative.get("analyst_summary"):
+            exec_parts.append(f'<p style="color:#94a3b8;font-size:12px;line-height:1.6;margin-top:.6rem"><strong style="color:#e2e8f0">Analyst Review:</strong> {_nl2br(narrative["analyst_summary"])}</p>')
+        if narrative.get("key_risks"):
+            items = "".join(f'<li style="margin-bottom:4px;color:#fca5a5">{_html.escape(str(r))}</li>' for r in narrative["key_risks"])
+            exec_parts.append(f'<div style="margin-top:.8rem"><strong style="color:#e2e8f0;font-size:12px">Key Risks:</strong><ul style="margin:.4rem 0 0 1.2rem;padding:0;font-size:12px">{items}</ul></div>')
+        if exec_parts:
+            exec_summary_html = _narrative_card(f"Executive Summary{draft_badge}", "".join(exec_parts))
+
+        # Remediation roadmap card
+        roadmap = narrative.get("remediation_roadmap", {})
+        if any(roadmap.get(k) for k in ("immediate", "30_days", "90_days")):
+            road_parts = []
+            labels = [("immediate", "#dc2626", "Immediate"), ("30_days", "#d97706", "Within 30 Days"), ("90_days", "#2563eb", "Within 90 Days")]
+            for key, color, label in labels:
+                items_list = roadmap.get(key, [])
+                if items_list:
+                    lis = "".join(f'<li style="margin-bottom:3px">{_html.escape(str(i))}</li>' for i in items_list)
+                    road_parts.append(
+                        f'<div style="margin-bottom:.8rem">'
+                        f'<span style="background:{color};color:#fff;font-size:10px;padding:1px 8px;border-radius:8px">{label}</span>'
+                        f'<ul style="margin:.4rem 0 0 1.2rem;padding:0;font-size:12px;color:#cbd5e1">{lis}</ul></div>'
+                    )
+            if road_parts:
+                roadmap_html = _narrative_card("Remediation Roadmap", "".join(road_parts))
+
     rating = summary.get("risk_rating","UNKNOWN")
     rc = {"CRITICAL":"#dc2626","HIGH":"#ea580c","MEDIUM":"#d97706","LOW":"#2563eb","CLEAN":"#16a34a"}.get(rating,"#6b7280")
 
@@ -491,6 +538,9 @@ pre{{white-space:pre-wrap;word-break:break-all}}
 
 {"" if not tool_breakdown else f'<div class="card"><h3 style="color:#f1f5f9;font-size:13px;margin-bottom:8px">Tools Used</h3><table style="width:100%;font-size:13px;border-collapse:collapse">{tool_rows}</table></div>'}
 
+{exec_summary_html}
+{roadmap_html}
+
 <h2 style="color:#f1f5f9;font-size:1rem;font-weight:600;border-bottom:1px solid #334155;padding-bottom:8px;margin-bottom:1.2rem">Findings</h2>
 {grouped_html or '<p style="color:#64748b">No findings recorded.</p>'}
 
@@ -519,6 +569,7 @@ def _gen_professional_pdf(session: dict, base: str) -> str:
 
     summary   = session.get("summary", {})
     findings  = session.get("enriched_findings", [])
+    narrative = session.get("report_narrative", {})
     target    = session.get("target", "Unknown")
     auth      = session.get("auth_used", "Unauthenticated")
     sid       = session.get("session_id", "-")
@@ -726,14 +777,26 @@ def _gen_professional_pdf(session: dict, base: str) -> str:
     pdf.add_page()
     _section_title("1.  Executive Summary")
 
-    _body(
-        f"This automated security assessment was conducted against {_s(target, 100)} "
-        f"using the AI Security Testing Agent v2.0. "
-        f"The objective was to identify and validate security vulnerabilities by simulating "
-        f"real-world attack scenarios aligned with OWASP Top 10 and NIST SP 800-53 standards. "
-        f"The assessment focused on authentication and authorisation mechanisms, session management, "
-        f"input validation, security misconfiguration, cryptography, and server/client-side attacks."
-    )
+    _exec_text = (narrative.get("executive_summary") or
+                  f"This automated security assessment was conducted against {_s(target, 100)} "
+                  f"using the AI Security Testing Agent v5.0. "
+                  f"The objective was to identify and validate security vulnerabilities by simulating "
+                  f"real-world attack scenarios aligned with OWASP Top 10 and NIST SP 800-53 standards. "
+                  f"The assessment focused on authentication and authorisation mechanisms, session management, "
+                  f"input validation, security misconfiguration, cryptography, and server/client-side attacks.")
+    _body(_exec_text, 1200)
+
+    if narrative.get("attack_surface"):
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(20, 30, 60)
+        pdf.cell(0, 8, "Attack Surface", 0, 1)
+        _body(narrative["attack_surface"], 800)
+
+    if narrative.get("analyst_summary"):
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(20, 30, 60)
+        pdf.cell(0, 8, "Analyst Review Summary", 0, 1)
+        _body(narrative["analyst_summary"], 400)
 
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_text_color(20, 30, 60)
@@ -1030,28 +1093,53 @@ def _gen_professional_pdf(session: dict, base: str) -> str:
 
     crit_n = bd.get("Critical", 0)
     high_n = bd.get("High", 0)
-    conclusion = (
-        f"The security assessment of {_s(target, 100)} identified {total_f} vulnerabilities "
-        f"across the application and its supporting infrastructure. "
-    )
-    if crit_n:
-        conclusion += (f"{crit_n} Critical severity finding(s) require immediate remediation "
-                       f"as they represent a high risk of full system compromise. ")
-    if high_n:
-        conclusion += f"{high_n} High severity finding(s) should be addressed as a priority. "
 
-    conclusion += (
-        "\n\nRecommendations:\n"
-        "1. Immediately remediate all Critical and High severity findings.\n"
-        "2. Address Medium severity findings within 30 days.\n"
-        "3. Track and remediate Low severity findings as part of regular maintenance.\n"
-        "4. Implement a Secure Software Development Lifecycle (SSDLC) process.\n"
-        "5. Establish a regular security testing cadence (quarterly for production applications).\n"
-        "6. Conduct developer security training covering OWASP Top 10 vulnerability classes.\n\n"
-        "Following remediation, a re-test is strongly recommended to verify that all identified "
-        "vulnerabilities have been successfully resolved and no regressions have been introduced."
-    )
-    _body(conclusion, 2000)
+    if narrative.get("conclusion"):
+        _body(narrative["conclusion"], 1500)
+        pdf.ln(2)
+
+    # Remediation roadmap from LLM narrative (or static fallback)
+    roadmap = narrative.get("remediation_roadmap", {})
+    if roadmap:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(20, 30, 60)
+        pdf.cell(0, 8, "Remediation Roadmap", 0, 1)
+        labels = [("immediate", "Immediate"), ("30_days", "Within 30 Days"), ("90_days", "Within 90 Days")]
+        for key, label in labels:
+            items = roadmap.get(key, [])
+            if items:
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_text_color(30, 41, 80)
+                pdf.cell(0, 6, label + ":", 0, 1)
+                pdf.set_font("Helvetica", "", 10)
+                pdf.set_text_color(51, 65, 85)
+                for item in items:
+                    pdf.set_x(pdf.l_margin)
+                    pdf.multi_cell(0, 5, _s(f"  - {item}", 260))
+                pdf.ln(2)
+    else:
+        # Static fallback
+        conclusion = (
+            f"The security assessment of {_s(target, 100)} identified {total_f} vulnerabilities "
+            f"across the application and its supporting infrastructure. "
+        )
+        if crit_n:
+            conclusion += (f"{crit_n} Critical severity finding(s) require immediate remediation "
+                           f"as they represent a high risk of full system compromise. ")
+        if high_n:
+            conclusion += f"{high_n} High severity finding(s) should be addressed as a priority. "
+        conclusion += (
+            "\n\nRecommendations:\n"
+            "1. Immediately remediate all Critical and High severity findings.\n"
+            "2. Address Medium severity findings within 30 days.\n"
+            "3. Track and remediate Low severity findings as part of regular maintenance.\n"
+            "4. Implement a Secure Software Development Lifecycle (SSDLC) process.\n"
+            "5. Establish a regular security testing cadence (quarterly for production applications).\n"
+            "6. Conduct developer security training covering OWASP Top 10 vulnerability classes.\n\n"
+            "Following remediation, a re-test is strongly recommended to verify that all identified "
+            "vulnerabilities have been successfully resolved and no regressions have been introduced."
+        )
+        _body(conclusion, 2000)
 
     try:
         pdf.output(path)

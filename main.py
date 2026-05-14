@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from orchestrator import Orchestrator
 from agents.reviewer_agent import ReviewerAgent
+from agents.report_agent import ReportAgent
 from agents.llm_client import get_llm
 from scan_config import ScanConfig
 from validator import validate_finding, validate_batch, get_validation_stats
@@ -57,7 +58,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # Completed sessions are read from DB. On restart active scans are lost (acceptable).
 sessions: dict = {}
 
-_reviewer = ReviewerAgent(llm=get_llm())
+_reviewer      = ReviewerAgent(llm=get_llm())
+_report_agent  = ReportAgent(llm=get_llm())
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -467,6 +469,13 @@ def submit_review(session_id: str, req: ReviewSubmission,
 
     # Determine new session status
     new_status = "completed" if queue["complete"] else "awaiting_validation"
+
+    # Finalise LLM report narrative once all reviews are done
+    if queue["complete"]:
+        s["enriched_findings"] = updated
+        final_narrative = _report_agent.finalise(s)
+        if session_id in sessions:
+            sessions[session_id]["report_narrative"] = final_narrative
 
     # Sync to in-memory session
     if session_id in sessions:
