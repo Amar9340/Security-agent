@@ -1,17 +1,8 @@
 """
-FastAPI Entry Point — v4 (Phase 2: DB persistence)
+FastAPI Entry Point — v5 (AI agents, LLM reviewer)
 
-Changes from v3:
-  - DB initialised on startup (SQLite by default, PostgreSQL via DATABASE_URL)
-  - In-memory `sessions` dict kept for active scans (real-time status polling)
-  - Completed sessions read from DB on restart (no data loss)
-  - All validation actions persisted to DB as audit trail
-  - Report paths saved to DB on generation
-  - /sessions endpoint reads from DB (paginated)
-  - /session/{id} falls back to DB if not in memory
-
-Scan modes supported:
-  full | checklist | single | owasp
+Scan modes:  full | checklist | single | owasp
+DB:          SQLite default, PostgreSQL via DATABASE_URL
 """
 import logging
 import uuid
@@ -29,8 +20,8 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from orchestrator import Orchestrator
-from agents.knowledge_agent import KnowledgeAgent, MODE_FULL
 from agents.reviewer_agent import ReviewerAgent
+from agents.llm_client import get_llm
 from scan_config import ScanConfig
 from validator import validate_finding, validate_batch, get_validation_stats
 from report_generator import generate_report
@@ -55,8 +46,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI VAPT Agent Platform",
-    version="4.0.0",
-    description="Knowledge Agent-driven VAPT. Checklist-first, OWASP fallback. Authorized use only.",
+    version="5.0.0",
+    description="LLM-driven VAPT agents. Recon → Web → Network → Cloud → Human review. Authorized use only.",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -66,8 +57,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # Completed sessions are read from DB. On restart active scans are lost (acceptable).
 sessions: dict = {}
 
-_ka       = KnowledgeAgent()    # singleton — loaded once at startup
-_reviewer = ReviewerAgent()
+_reviewer = ReviewerAgent(llm=get_llm())
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
@@ -213,12 +203,11 @@ def _get_session_dict(session_id: str, db: Session) -> dict:
 def root(db: Session = Depends(get_db)):
     return {
         "agent":           "AI VAPT Agent Platform",
-        "version":         "4.0.0",
+        "version":         "5.0.0",
         "status":          "online",
         "docs":            "/docs",
         "sessions_active": len(sessions),
         "sessions_total":  crud.count_sessions(db),
-        "checklist_items": len(_ka.get_all_test_names()),
     }
 
 
@@ -321,7 +310,7 @@ def get_status(session_id: str, db: Session = Depends(get_db)):
 
 @app.get("/session/{session_id}/plan")
 def get_execution_plan(session_id: str, db: Session = Depends(get_db)):
-    """Show what the Knowledge Agent resolved for this session."""
+    """Show the agent execution plan for this session."""
     return _get_session_dict(session_id, db).get("execution_plan", {})
 
 
@@ -367,54 +356,6 @@ def delete_session(session_id: str, db: Session = Depends(get_db)):
         db.commit()
         return {"message": f"Session {session_id} deleted from memory and DB"}
     return {"message": f"Session {session_id} removed from memory (not in DB)"}
-
-
-# ── Checklist routes ───────────────────────────────────────────────────────────
-
-@app.get("/checklist")
-def list_checklist(domain: Optional[str] = Query(None)):
-    """List all available tests. Filter by domain: web | network | cloud"""
-    names = _ka.get_tests_by_domain(domain) if domain else _ka.get_all_test_names()
-    return {"count": len(names), "tests": names}
-
-
-@app.get("/checklist/search")
-def search_checklist(q: str = Query(..., min_length=2)):
-    """Search tests by name or alias. Used for UI autocomplete."""
-    results = _ka.search(q)
-    return {"query": q, "count": len(results), "results": results}
-
-
-@app.get("/checklist/{item_id}")
-def get_checklist_item(item_id: str):
-    """Get full definition of a single checklist item by ID (e.g. WEB-001)."""
-    item = _ka.get_item_by_id(item_id.upper())
-    if not item:
-        raise HTTPException(404, f"Checklist item '{item_id}' not found")
-    return item
-
-
-@app.post("/checklist/preview")
-def preview_execution_plan(
-    target:          str       = Query(...),
-    scan_mode:       str       = Query("full"),
-    requested_tests: list[str] = Query(default=[]),
-):
-    """Preview the Knowledge Agent's resolution without running a scan."""
-    plan = _ka.resolve(target=target, mode=scan_mode,
-                       requested_tests=requested_tests if requested_tests else None)
-    return {
-        "scan_mode":       plan.scan_mode,
-        "tests_resolved":  len(plan.resolved_tests),
-        "fallback_used":   plan.fallback_used,
-        "resolution_log":  plan.resolution_log,
-        "agent_groups": {
-            agent: [{"id": t.checklist_id, "name": t.canonical_name,
-                     "source": t.source, "fallback": t.fallback}
-                    for t in tests]
-            for agent, tests in plan.agent_groups.items()
-        },
-    }
 
 
 # ── Validation routes ─────────────────────────────────────────────────────────

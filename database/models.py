@@ -130,6 +130,12 @@ class ScanFinding(Base):
     validated_at          = Column(DateTime,   nullable=True)
     false_positive        = Column(Boolean,    nullable=False, default=False)
 
+    # Human review (Phase 6 — Reviewer Agent)
+    review_brief          = Column(JSONText,    nullable=True)   # LLM-generated brief
+    reviewer              = Column(String(128), nullable=True)
+    reviewer_notes        = Column(Text,        nullable=True)
+    reviewed              = Column(Boolean,     nullable=False, default=False)
+
     # Timestamps
     enriched_at           = Column(DateTime,   nullable=True)
     created_at            = Column(DateTime,   nullable=False, default=datetime.utcnow)

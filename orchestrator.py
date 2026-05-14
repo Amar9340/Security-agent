@@ -27,7 +27,7 @@ from database import crud
 logger = logging.getLogger(__name__)
 
 # Singletons — loaded once, shared across all scan sessions
-_reviewer_agent = ReviewerAgent()
+_reviewer_agent = ReviewerAgent(llm=get_llm())
 _recon_agent    = ReconAgent(llm=get_llm())
 _web_agent      = WebAgent(llm=get_llm())
 _network_agent  = NetworkAgent(llm=get_llm())

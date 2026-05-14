@@ -1,17 +1,21 @@
 """
-Reviewer Agent — Phase 3
+ReviewerAgent — LLM-driven human review gate.
 
-Triages enriched findings after FP analysis and builds a human review queue.
+Replaces the 3-if-statement triage logic with LLM-generated review briefs.
+For every Critical/High finding the LLM writes a structured brief so the
+analyst can make an informed decision quickly.
 
-Rules:
-  - Critical / High severity  → always queued for analyst sign-off
-  - fp_status == "uncertain"  → queued (AI wasn't confident enough)
-  - fp_status == "likely_false_positive" → auto-suppressed, never queued
-  - Everything else           → passes through without review
+Flow:
+  build_review_queue(findings)
+    → triage: Critical/High queued, likely_FP auto-suppressed
+    → for each queued finding: generate_brief(finding) via LLM
+    → returns queue dict with briefs attached
 
-Analyst decisions: confirm | false_positive | downgrade | escalate | needs_retest
+Analyst decisions (unchanged):
+  confirm | false_positive | downgrade | escalate | needs_retest
 """
 import logging
+import json
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -20,20 +24,46 @@ REVIEW_SEVERITIES = {"Critical", "High"}
 VALID_ACTIONS     = {"confirm", "false_positive", "downgrade", "escalate", "needs_retest"}
 _SEV_ORDER        = ["Info", "Low", "Medium", "High", "Critical"]
 
+_BRIEF_SYSTEM_PROMPT = """You are a senior penetration tester reviewing a scan finding before it goes to an analyst.
+Write a concise review brief that helps the analyst make a fast, informed decision.
+
+Output ONLY valid JSON with exactly these fields:
+{
+  "evidence_quality":   "strong | moderate | weak",
+  "fp_likelihood":      "unlikely | possible | likely",
+  "fp_reasoning":       "one sentence — why this could or could not be a false positive",
+  "attack_chain":       "concrete step-by-step: how attacker discovers → exploits → impacts",
+  "business_impact":    "specific business consequence if exploited",
+  "suggested_decision": "confirm | false_positive | downgrade | needs_retest",
+  "reasoning":          "one or two sentences justifying the suggested decision",
+  "confidence":         "high | medium | low"
+}
+
+Be direct. Analysts are busy. No hedging, no fluff."""
+
 
 class ReviewerAgent:
 
+    def __init__(self, llm=None):
+        self.llm = llm
+
     # ── Queue building ─────────────────────────────────────────────────────────
 
-    def triage(self, findings: list) -> list:
-        """Return list of findings that need human review, highest-risk first."""
-        items = []
+    def build_review_queue(self, findings: list) -> dict:
+        """
+        Triage findings, generate LLM briefs for Critical/High, return queue dict.
+        If no LLM is available, briefs are skipped (backward compatible).
+        """
+        items           = []
+        auto_suppressed = 0
+
         for f in findings:
             fp_status = f.get("fp_status", "uncertain")
             severity  = f.get("severity", "Info")
 
             if fp_status == "likely_false_positive":
-                continue   # auto-suppressed — no human needed
+                auto_suppressed += 1
+                continue
 
             reason = None
             if severity in REVIEW_SEVERITIES:
@@ -41,35 +71,35 @@ class ReviewerAgent:
             elif fp_status == "uncertain":
                 reason = "AI confidence uncertain — analyst review required"
 
-            if reason:
-                items.append({
-                    "finding_id":       f.get("id", ""),
-                    "name":             f.get("name", "Unknown"),
-                    "severity":         severity,
-                    "cvss_score":       f.get("cvss_score") or 0.0,
-                    "url":              f.get("url", ""),
-                    "reason":           reason,
-                    "fp_status":        fp_status,
-                    "confidence_score": f.get("confidence_score") or 0.5,
-                    "review_status":    "pending",
-                })
+            if not reason:
+                continue
+
+            brief = self._generate_brief(f) if self.llm else {}
+
+            items.append({
+                "finding_id":       f.get("id", ""),
+                "name":             f.get("name", "Unknown"),
+                "severity":         severity,
+                "cvss_score":       f.get("cvss_score") or 0.0,
+                "url":              f.get("url", ""),
+                "type":             f.get("type", ""),
+                "module":           f.get("module", ""),
+                "reason":           reason,
+                "fp_status":        fp_status,
+                "confidence_score": f.get("confidence_score") or 0.5,
+                "review_status":    "pending",
+                "brief":            brief,
+            })
 
         items.sort(key=lambda x: (
             -(_SEV_ORDER.index(x["severity"]) if x["severity"] in _SEV_ORDER else 0),
             -(x["cvss_score"] or 0),
         ))
-        return items
-
-    def build_review_queue(self, findings: list) -> dict:
-        """Build the review queue dict stored on the session object."""
-        items           = self.triage(findings)
-        auto_suppressed = sum(1 for f in findings
-                              if f.get("fp_status") == "likely_false_positive")
 
         logger.info(
-            f"[REVIEWER] {len(items)} need review | "
+            f"[REVIEWER] {len(items)} queued | "
             f"{auto_suppressed} auto-suppressed | "
-            f"{len(findings) - len(items) - auto_suppressed} passed through"
+            f"briefs={'yes' if self.llm else 'skipped (no LLM)'}"
         )
 
         return {
@@ -83,11 +113,46 @@ class ReviewerAgent:
         }
 
     def refresh_progress(self, queue: dict, findings: list) -> dict:
-        """Recompute reviewed/pending counters after decisions are applied."""
         reviewed = sum(1 for f in findings if f.get("reviewed"))
         pending  = max(0, queue.get("needs_review", 0) - reviewed)
         return {**queue, "reviewed": reviewed, "pending": pending,
                 "complete": pending == 0}
+
+    # ── LLM brief generation ───────────────────────────────────────────────────
+
+    def _generate_brief(self, finding: dict) -> dict:
+        """Ask the LLM to write a review brief for a single finding."""
+        user_prompt = (
+            f"Finding: {finding.get('name', '')} [{finding.get('severity', '')}]\n"
+            f"Type: {finding.get('type', '')}\n"
+            f"URL: {finding.get('url', '')}\n"
+            f"CVSS: {finding.get('cvss_score', 'N/A')}\n"
+            f"Tool: {finding.get('tool_used', '')}\n"
+            f"Module: {finding.get('module', '')}\n"
+            f"Description: {finding.get('description', '')[:400]}\n"
+            f"Evidence: {json.dumps(finding.get('evidence') or {})[:600]}\n"
+            f"Analyst note: {finding.get('analyst_note', '')}"
+        )
+
+        try:
+            brief = self.llm.chat_json(
+                system      = _BRIEF_SYSTEM_PROMPT,
+                user        = user_prompt,
+                temperature = 0.1,
+                max_tokens  = 512,
+            )
+            if brief and isinstance(brief, dict):
+                logger.debug(
+                    f"[REVIEWER] Brief for {finding.get('id','?')} "
+                    f"({finding.get('name','')[:40]}): "
+                    f"suggested={brief.get('suggested_decision')} "
+                    f"fp={brief.get('fp_likelihood')}"
+                )
+                return brief
+        except Exception as e:
+            logger.warning(f"[REVIEWER] Brief generation failed for "
+                           f"{finding.get('id','?')}: {e}")
+        return {}
 
     # ── Decision application ───────────────────────────────────────────────────
 
@@ -95,14 +160,12 @@ class ReviewerAgent:
         """
         Apply analyst decisions to findings.
 
-        Each decision dict must have:
-          finding_id  — str
-          action      — confirm | false_positive | downgrade | escalate | needs_retest
-          analyst     — str (name)
-          notes       — str (optional)
+        Each decision dict:
+          finding_id   — str
+          action       — confirm | false_positive | downgrade | escalate | needs_retest
+          analyst      — str
+          notes        — str (optional)
           new_severity — str (required for downgrade / escalate)
-
-        Returns a new list; originals are not mutated.
         """
         dec_map = {d["finding_id"]: d for d in decisions}
         updated = []
@@ -131,13 +194,15 @@ class ReviewerAgent:
                 f["severity"]          = "Info"
                 f["validation_status"] = "rejected"
                 f["fp_status"]         = "confirmed_false_positive"
+                f["false_positive"]    = True
 
             elif action in ("downgrade", "escalate"):
                 new_sev = d.get("new_severity", "")
                 if new_sev in _SEV_ORDER:
                     f["severity"] = new_sev
                 else:
-                    logger.warning(f"[REVIEWER] {action} for {fid}: invalid new_severity '{new_sev}'")
+                    logger.warning(f"[REVIEWER] {action} for {fid}: "
+                                   f"invalid new_severity '{new_sev}'")
                 f["validation_status"] = "confirmed"
 
             elif action == "confirm":
@@ -151,5 +216,5 @@ class ReviewerAgent:
 
         confirmed = sum(1 for f in updated if f.get("review_status") == "confirm")
         rejected  = sum(1 for f in updated if f.get("review_status") == "false_positive")
-        logger.info(f"[REVIEWER] Applied — confirmed={confirmed} | fp_rejected={rejected}")
+        logger.info(f"[REVIEWER] Applied — confirmed={confirmed} fp_rejected={rejected}")
         return updated
