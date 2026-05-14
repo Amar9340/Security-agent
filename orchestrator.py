@@ -20,8 +20,8 @@ from agents.fp_agent import analyse_findings
 from agents.reviewer_agent import ReviewerAgent
 from agents.recon_agent import ReconAgent
 from agents.web_agent import WebAgent
+from agents.network_agent import NetworkAgent
 from agents.llm_client import get_llm
-from modules.network_module import run_network_scan
 from modules.cloud_module import run_cloud_scan
 from enrichment import enrich_findings
 from database import crud
@@ -33,6 +33,7 @@ _knowledge_agent = KnowledgeAgent()
 _reviewer_agent  = ReviewerAgent()
 _recon_agent     = ReconAgent(llm=get_llm())
 _web_agent       = WebAgent(llm=get_llm())
+_network_agent   = NetworkAgent(llm=get_llm())
 
 
 class Orchestrator:
@@ -206,7 +207,7 @@ class Orchestrator:
         task_map = {}
         if "network_agent" in agent_groups:
             _items = agent_groups["network_agent"]
-            task_map["network_agent"] = lambda i=_items: run_network_scan(
+            task_map["network_agent"] = lambda i=_items: _network_agent.run(
                 target, recon, self.config,
                 checklist_items=i
             )
