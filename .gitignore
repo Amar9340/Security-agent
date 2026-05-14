@@ -7,3 +7,4 @@ reports/
 *.log
 *.db
 prowler_test/
+PLAN.md
